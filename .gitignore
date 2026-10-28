@@ -1,6 +1,6 @@
 # Python 缓存
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
 
 # 虚拟环境
