@@ -1,0 +1,32 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 虚拟环境
+.venv/
+venv/
+
+# 运行数据：里面有个人笔记、图片和数据库，绝对不要提交
+data/
+dist/知识节点/data/
+
+# 打包中间产物
+build/
+*.spec
+
+# 内部工作流、提示词与验收报告，不对外公开
+docs/
+
+# 快捷方式（里面是本机绝对路径）
+*.lnk
+
+# 系统与编辑器
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# 临时文件
+*.log
+*.tmp
