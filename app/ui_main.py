@@ -4,7 +4,7 @@ app/ui_main.py —— 主窗口
 
 职责：
 1. 左侧科目区：科目列表 + 右键菜单（空白处新建科目，科目上改名或删除）；
-2. 右侧节点区：顶部「日历」「?」按钮 + 搜索框 +「按忘过次数排序」复选框 +
+2. 右侧节点区：顶部「日历」「?」按钮 + 搜索框 +「排序」菜单 +
    节点表格（ttk.Treeview）；表格空白处右键新建节点；节点上右键
    「忘记了 / 没忘记 / 打开 / 重命名 / 删除」；
 3. 把用户操作接到 app\\db.py 的增删改查函数上，并在操作后刷新界面。
@@ -13,16 +13,18 @@ app/ui_main.py —— 主窗口
 - 节点右键选「忘记了」＝记下「逻辑今天忘了它」；选「没忘记」＝撤销今天的标记；
 - 节点表格有三列：标题、忘过次数、最近标记日期，统计由 db.list_nodes 一条
   SQL 聚合出来，本文件只负责显示；
-- 日常模式（复选框不勾）：逻辑今天被标记过的节点整行红色，并且置顶；
-- 次数模式（复选框勾上）：按忘过次数从多到少排；当天标记的节点**仍然红色**，
-  但**不再置顶**，否则次数排序就失真了；
+- 排序由搜索框右侧的「排序：…」菜单选择：
+  「按最近浏览时间」「按忘记次数」「按最近忘记时间」，每种都能再选升序或降序；
+- 逻辑今天被标记过的节点，无论选哪种排序都**显示红色**；
+- 只有「按最近浏览时间 + 降序」这个默认日常模式才**置顶**；其他排序和升序都不置顶，
+  否则排序结果就被置顶规则打乱了；
 - 红色由数据库算出的 is_marked_today 决定，本文件只照着打 tag，
   不在这里挪行、也不缓存标记状态；
 - 标记和撤销都不弹提示、也不写状态栏：列表里变红（或红色消失）本身就是反馈。
 
 说明：
 - 节点表格用 ttk.Treeview（不是 Listbox）；有笔记图片的节点，标题后面会显示「[3 图]」；
-- 节点顺序完全由数据库查询决定（两种排序共用 db._fetch_nodes 的一条 SQL），
+- 节点顺序完全由数据库查询决定（三种排序共用 db._fetch_nodes 的一条 SQL），
   本文件不做任何排序；
 - 「?」按钮打开只读、可滚动的帮助窗（HelpDialog，在 ui_dialogs.py 里）；
 - 本文件不写 SQL，也不直接弹节点详情窗、日历窗、帮助窗的界面，
@@ -30,6 +32,7 @@ app/ui_main.py —— 主窗口
 """
 
 import tkinter as tk
+import tkinter.font as tkfont
 import tkinter.font as tkfont
 from tkinter import messagebox, simpledialog, ttk
 
@@ -50,8 +53,9 @@ class MainWindow:
         self.current_subject_id = None  # 当前选中的科目 id；没有则为 None
         self.subjects = []  # 当前科目列表（sqlite3.Row 的列表）
         self.keyword_var = tk.StringVar()  # 搜索框里的关键词
-        # 「按忘过次数排序」开关：默认不勾选，保持日常的「最近打开时间」排序
-        self.sort_by_marks_var = tk.BooleanVar(value=False)
+        # 排序方式：默认「按最近浏览时间 + 降序」，保持原来的日常排序
+        self.sort_mode_var = tk.StringVar(value=db.SORT_VIEWED)
+        self.sort_order_var = tk.StringVar(value='desc')  # desc=降序，asc=升序
         self.calendar_dialog = None  # 日历窗口（同时只开一个）
         self.help_dialog = None  # 帮助窗口（同时只开一个）
 
@@ -114,20 +118,65 @@ class MainWindow:
         )
         self.help_button.grid(row=0, column=2, sticky='e', padx=(8, 0))
 
-        # 第二行：搜索框 + 「按忘过次数排序」开关（默认不勾选）
+        # 第二行：搜索框 + 排序菜单（默认「最近浏览 + 降序」）
         search_frame = ttk.Frame(right)
         search_frame.grid(row=1, column=0, sticky='ew', pady=(0, 8))
         search_frame.columnconfigure(1, weight=1)
         ttk.Label(search_frame, text='搜索：').grid(row=0, column=0, sticky='w')
         self.search_entry = ttk.Entry(search_frame, textvariable=self.keyword_var)
         self.search_entry.grid(row=0, column=1, sticky='ew', padx=(4, 0))
-        self.sort_by_marks_check = ttk.Checkbutton(
-            search_frame,
-            text='按忘过次数排序',
-            variable=self.sort_by_marks_var,
+
+        # 排序菜单按钮：点一下弹出菜单，菜单里选「排序字段」和「升序/降序」。
+        # 用 tk.Menu 是为了让外观接近系统菜单（带勾选标记），不在主界面堆一排单选按钮。
+        self.sort_button = ttk.Menubutton(search_frame, text='排序：最近浏览 ↓', width=18)
+        self.sort_menu = tk.Menu(self.sort_button, tearoff=False)
+        # 这些文字也用来估算菜单宽度，保证菜单不会伸出屏幕（见 _show_sort_menu）
+        self._sort_menu_labels = [
+            '按最近浏览时间',
+            '按忘记次数',
+            '按最近忘记时间',
+            '降序（新的 / 多的在前）',
+            '升序（旧的 / 少的在前）',
+        ]
+        self.sort_menu.add_radiobutton(
+            label=self._sort_menu_labels[0],
+            variable=self.sort_mode_var,
+            value=db.SORT_VIEWED,
             command=self._on_sort_mode_changed,
         )
-        self.sort_by_marks_check.grid(row=0, column=2, sticky='e', padx=(10, 0))
+        self.sort_menu.add_radiobutton(
+            label=self._sort_menu_labels[1],
+            variable=self.sort_mode_var,
+            value=db.SORT_MARKS,
+            command=self._on_sort_mode_changed,
+        )
+        self.sort_menu.add_radiobutton(
+            label=self._sort_menu_labels[2],
+            variable=self.sort_mode_var,
+            value=db.SORT_LAST_MARK,
+            command=self._on_sort_mode_changed,
+        )
+        self.sort_menu.add_separator()
+        self.sort_menu.add_radiobutton(
+            label=self._sort_menu_labels[3],
+            variable=self.sort_order_var,
+            value='desc',
+            command=self._on_sort_mode_changed,
+        )
+        self.sort_menu.add_radiobutton(
+            label=self._sort_menu_labels[4],
+            variable=self.sort_order_var,
+            value='asc',
+            command=self._on_sort_mode_changed,
+        )
+        self.sort_button.configure(menu=self.sort_menu)
+        self.sort_button.grid(row=0, column=2, sticky='e', padx=(10, 0))
+        # 自己算菜单的弹出位置：让菜单右边缘和按钮右边缘对齐。
+        # 如果直接用 Menubutton 默认的弹出方式，按钮又靠在窗口右边，
+        # 菜单会往右伸出屏幕，后面的字就被截掉了。
+        self.sort_button.bind('<Button-1>', self._show_sort_menu)
+        self.sort_button.bind('<space>', self._show_sort_menu)
+        self._update_sort_button_text()
 
         # 第三行：节点表格
         tree_frame = ttk.Frame(right)
@@ -377,17 +426,19 @@ class MainWindow:
 
     def refresh_nodes(self, select_id=None):
         """
-        按「当前科目 + 当前搜索词 + 当前排序开关」重新读取节点并填满右侧表格。
+        按「当前科目 + 当前搜索词 + 当前排序方式」重新读取节点并填满右侧表格。
 
         搜索与排序都交给 db.list_nodes 的同一个查询完成，这里不再排序。
-        两种模式下红色的规则（重要）：
-        - 日常模式（复选框不勾）：逻辑今天标记过的行显示红色，并且置顶；
-        - 次数模式（复选框勾上）：逻辑今天标记过的行**仍然显示红色**，
-          但数据库查询里不按它置顶，所以**不会**跑到最上面；
+        红色与置顶规则（重要）：
+        - 逻辑今天标记过的行，无论选哪种排序都显示红色；
+        - 只有「按最近浏览时间 + 降序」的默认日常模式才置顶；
+        - 按次数、按最近忘记时间，以及任何升序，都只红不置顶，
+          否则排序结果会被置顶规则打乱；
         结果为空时用提示文字代替表格。
         """
         keyword = self.keyword_var.get().strip()
-        sort_by_marks = self.sort_by_marks_var.get()
+        sort_mode = self.sort_mode_var.get()
+        descending = self.sort_order_var.get() == 'desc'
         self.tree.delete(*self.tree.get_children())
 
         if self.current_subject_id is None:
@@ -397,10 +448,13 @@ class MainWindow:
                 self._show_placeholder('请先在左边选中一个科目')
             return
 
-        # 两种模式共用这一个函数、同一条 SQL，只由 sort_by_marks 决定 ORDER BY；
-        # 搜索关键词也一起传进去，保证「次数排序 + 搜索」仍然按次数排。
+        # 所有排序共用这一个函数、同一条 SQL，只由 sort_mode + descending 决定 ORDER BY；
+        # 搜索关键词也一起传进去，保证「排序 + 搜索」仍然按当前方式排。
         nodes = db.list_nodes(
-            self.current_subject_id, keyword, sort_by_marks=sort_by_marks
+            self.current_subject_id,
+            keyword,
+            sort_mode=sort_mode,
+            descending=descending,
         )
 
         if not nodes:
@@ -461,20 +515,68 @@ class MainWindow:
         self.tree_scroll.grid()
 
     def _on_keyword_changed(self, *args):
-        """搜索框内容一变就立刻重新筛选（两种排序模式下都生效）。"""
+        """搜索框内容一变就立刻重新筛选（各种排序方式下都生效）。"""
         self.refresh_nodes()
+
+    def _show_sort_menu(self, event=None):
+        """
+        在按钮下方弹出排序菜单，并让菜单的右边缘贴着按钮的右边缘。
+
+        这样做是为了防止主窗口靠屏幕右边时，菜单伸出屏幕、文字被截掉。
+        返回 'break' 是为了拦住 Menubutton 自带的弹出动作，避免菜单弹两次。
+        """
+        self.sort_menu.update_idletasks()
+        # 菜单还没显示时 winfo_reqwidth() 不可靠，改为按菜单字体量一下最长的文字，
+        # 再加上勾选标记和左右内边距，估算菜单宽度。
+        menu_font = tkfont.nametofont('TkDefaultFont')
+        text_width = max(menu_font.measure(text) for text in self._sort_menu_labels)
+        menu_width = text_width + 80
+        # 五行菜单项 + 一条分隔线，按字体行高估算菜单高度
+        menu_height = menu_font.metrics('linespace') * 7 + 16
+        x = self.sort_button.winfo_rootx() + self.sort_button.winfo_width() - menu_width
+        y = self.sort_button.winfo_rooty() + self.sort_button.winfo_height()
+        screen_width = self.sort_button.winfo_screenwidth()
+        screen_height = self.sort_button.winfo_screenheight()
+        if x + menu_width > screen_width:
+            x = screen_width - menu_width - 8
+        if x < 8:
+            x = 8
+        if y + menu_height > screen_height:
+            # 窗口靠屏幕下边时，菜单改为向上弹，避免下半截看不见
+            y = self.sort_button.winfo_rooty() - menu_height
+        if y < 8:
+            y = 8
+        try:
+            self.sort_menu.tk_popup(x, y)
+        finally:
+            self.sort_menu.grab_release()
+        return 'break'
 
     def _on_sort_mode_changed(self):
         """
-        勾选或取消「按忘过次数排序」：立刻按新排序重画，不需要重启程序。
+        在排序菜单里换了排序字段或升/降序：立刻按新排序重画，不需要重启程序。
 
-        勾上：按忘过次数从多到少；同次数按最近标记日期从新到旧；
-              从没标记过的排最后；当天标记的节点仍然红色，但不再置顶。
-        取消：恢复日常排序（当天标记的红色并置顶，其余按最近打开时间）。
+        三种字段：
+        - 最近浏览：降序＝最近看过的在前；升序＝最久没看的在前；
+        - 忘记次数：降序＝忘得多的在前；升序＝忘得少的在前；
+        - 最近忘记：降序＝最近忘的在前；升序＝忘得最久的在前。
+        不管选哪种，当天标记的节点仍然红色；只有「最近浏览 + 降序」才置顶。
         重画时尽量保持当前选中的节点，避免它从视野里跑丢。
         """
         selected_id = self._selected_node_id()
+        self._update_sort_button_text()
         self.refresh_nodes(select_id=selected_id)
+
+    def _update_sort_button_text(self):
+        """把按钮文字更新成「排序：字段 ↑/↓」，让用户一眼看到当前排序。"""
+        labels = {
+            db.SORT_VIEWED: '最近浏览',
+            db.SORT_MARKS: '忘记次数',
+            db.SORT_LAST_MARK: '最近忘记',
+        }
+        mode_text = labels.get(self.sort_mode_var.get(), '最近浏览')
+        arrow = '↓' if self.sort_order_var.get() == 'desc' else '↑'
+        self.sort_button.configure(text='排序：%s %s' % (mode_text, arrow))
 
     def _selected_node_id(self):
         """返回右侧表格里当前选中的节点 id，没选中返回 None。"""

@@ -245,17 +245,30 @@ def _like_pattern(keyword):
     return '%' + text + '%'
 
 
-def _fetch_nodes(subject_id, keyword=None, sort_by_marks=False):
+# 三种排序字段的固定名字，界面只传这三个值，数据库侧只认这三个值
+SORT_VIEWED = 'viewed'        # 按最近浏览时间
+SORT_MARKS = 'marks'          # 按忘记次数
+SORT_LAST_MARK = 'last_mark'  # 按最近忘记时间
+
+SORT_MODES = (SORT_VIEWED, SORT_MARKS, SORT_LAST_MARK)
+
+
+def _fetch_nodes(subject_id, keyword=None, sort_mode=SORT_VIEWED, descending=True):
     """
     内部函数：按科目取节点，一次查完每个节点的「标记总次数」和「最近一次标记日期」。
 
-    两种排序共用这一个查询，只有最后一段 ORDER BY 不同，避免写两份重复代码：
-    - 日常模式（sort_by_marks=False）：逻辑今天被标记过的节点置顶并显示红色；
-      其余按最近打开时间倒序，从没打开过的按创建时间倒序。
-    - 临考模式（sort_by_marks=True）：按标记总次数从多到少；次数相同按最近标记
-      日期从新到旧；从未标记过的排最后。此模式下当天标记的节点**仍然显示红色**
-      （is_marked_today 照常返回），但 ORDER BY 里故意不含 is_marked_today，
-      所以**不再置顶**——否则「按次数排序」就被置顶规则打乱了。
+    三种排序共用这一个查询，只有最后一段 ORDER BY 不同，避免写两份重复代码：
+    - 按最近浏览时间（SORT_VIEWED）：看 last_viewed_at；降序是最近看过的在前，
+      升序是最久没看的在前，从没打开过的都排最后。
+    - 按忘记次数（SORT_MARKS）：看 mark_count；降序是忘得多的在前，升序是忘得少的
+      在前；次数相同时再按最近忘记日期排。
+    - 按最近忘记时间（SORT_LAST_MARK）：看 last_mark_date；降序是最近忘的在前，
+      升序是忘得最久的在前；从没标记过的节点始终排最后，不参与「最早」的比较。
+
+    红色与置顶规则（重要）：
+    - 逻辑今天被标记过的节点，无论选哪种排序，**都仍然显示红色**；
+    - 但只有「按最近浏览时间 + 降序」这一种默认日常模式才**置顶**；
+      其余模式和升序都故意不按今天标记置顶，否则排序结果就被置顶规则打乱了。
 
     次数统计用 LEFT JOIN 一个聚合子查询（COUNT / MAX）一次算完，
     不在 Python 里对每个节点各查一次数据库，节点上百条时也不会卡。
@@ -269,6 +282,9 @@ def _fetch_nodes(subject_id, keyword=None, sort_by_marks=False):
     「今天有没有被标记」用 LEFT JOIN + 唯一索引判断：
     (node_id, marked_date) 唯一，所以一个节点最多关联出一行，不会把节点查重。
     """
+    if sort_mode not in SORT_MODES:
+        raise ValueError('未知排序方式：%r' % (sort_mode,))
+
     today = dates.today_text()
     sql = (
         'SELECT n.id, n.subject_id, n.title, n.content, n.created_at, n.last_viewed_at, '
@@ -291,22 +307,55 @@ def _fetch_nodes(subject_id, keyword=None, sort_by_marks=False):
         params.append(pattern)
         params.append(pattern)
 
-    if sort_by_marks:
-        # 临考模式：次数降序 → 最近标记日期降序（NULL 在 SQLite 里最小，
-        # DESC 时自然排最后）→ 再按最近打开、创建时间兜底，保证顺序稳定。
-        # 注意：这里没有 is_marked_today，所以当天标记的节点只显示红色、不置顶。
-        sql += (
-            ' ORDER BY COALESCE(agg.mark_count, 0) DESC, '
-            '(agg.last_mark_date IS NULL) ASC, agg.last_mark_date DESC, '
-            '(n.last_viewed_at IS NULL) ASC, n.last_viewed_at DESC, '
-            'n.created_at DESC, n.id DESC'
-        )
+    if sort_mode == SORT_VIEWED:
+        if descending:
+            # 默认日常模式：当天标记的置顶（红色同时保留），再按最近打开时间倒序。
+            sql += (
+                ' ORDER BY is_marked_today DESC, (n.last_viewed_at IS NULL) ASC, '
+                'n.last_viewed_at DESC, n.created_at DESC, n.id DESC'
+            )
+        else:
+            # 最近浏览升序：最久没看的在前，从没打开过的排最后。
+            # 这里不含 is_marked_today，所以当天标记的节点只红、不置顶。
+            sql += (
+                ' ORDER BY (n.last_viewed_at IS NULL) ASC, n.last_viewed_at ASC, '
+                'n.created_at ASC, n.id ASC'
+            )
+    elif sort_mode == SORT_MARKS:
+        if descending:
+            # 次数降序：次数多 → 最近忘记日期新 → 最近打开 → 创建时间。
+            sql += (
+                ' ORDER BY COALESCE(agg.mark_count, 0) DESC, '
+                '(agg.last_mark_date IS NULL) ASC, agg.last_mark_date DESC, '
+                '(n.last_viewed_at IS NULL) ASC, n.last_viewed_at DESC, '
+                'n.created_at DESC, n.id DESC'
+            )
+        else:
+            # 次数升序：0 次在前，次数少的在前；同次数时忘得早的在前。
+            sql += (
+                ' ORDER BY COALESCE(agg.mark_count, 0) ASC, '
+                '(agg.last_mark_date IS NULL) ASC, agg.last_mark_date ASC, '
+                '(n.last_viewed_at IS NULL) ASC, n.last_viewed_at DESC, '
+                'n.created_at ASC, n.id ASC'
+            )
     else:
-        # 日常模式：当天标记的置顶（红色同时保留），再按最近打开时间排序。
-        sql += (
-            ' ORDER BY is_marked_today DESC, (n.last_viewed_at IS NULL) ASC, '
-            'n.last_viewed_at DESC, n.created_at DESC, n.id DESC'
-        )
+        # 按最近忘记时间排序。NULL 表示从没忘记过，用「IS NULL ASC」把它压到最后。
+        if descending:
+            # 最近忘的在前；同一天忘的，忘得多的在前。
+            sql += (
+                ' ORDER BY (agg.last_mark_date IS NULL) ASC, agg.last_mark_date DESC, '
+                'COALESCE(agg.mark_count, 0) DESC, '
+                '(n.last_viewed_at IS NULL) ASC, n.last_viewed_at DESC, '
+                'n.created_at DESC, n.id DESC'
+            )
+        else:
+            # 忘得最久的在前；从没忘记过的仍然排最后。
+            sql += (
+                ' ORDER BY (agg.last_mark_date IS NULL) ASC, agg.last_mark_date ASC, '
+                'COALESCE(agg.mark_count, 0) ASC, '
+                '(n.last_viewed_at IS NULL) ASC, n.last_viewed_at DESC, '
+                'n.created_at ASC, n.id ASC'
+            )
 
     rows = get_connection().execute(sql, params).fetchall()
     return list(rows)
@@ -339,29 +388,33 @@ def get_node(node_id):
     return row
 
 
-def list_nodes(subject_id, keyword=None, sort_by_marks=False):
+def list_nodes(subject_id, keyword=None, sort_mode=SORT_VIEWED, descending=True):
     """
-    查某个科目下的节点，可选搜索关键词，可选两种排序。
+    查某个科目下的节点，可选搜索关键词，可选三种排序和升/降序。
 
-    sort_by_marks=False：日常排序（今天标记的置顶并显示红色，其余按最近打开时间）；
-    sort_by_marks=True：临考排序（按忘过次数从多到少，当天标记仍红但不置顶）。
+    sort_mode：
+    - SORT_VIEWED：按最近浏览时间（默认）；
+    - SORT_MARKS：按忘记次数；
+    - SORT_LAST_MARK：按最近忘记时间。
+    descending=True 是降序，False 是升序。
 
-    搜索与排序都在这一个函数里完成，主界面两种模式都调用它。
+    搜索与排序都在这一个函数里完成，主界面所有排序都调用它，
+    不另写「带搜索的排序」和「不带搜索的排序」两份代码。
     """
     if keyword is None:
         keyword = ''
     keyword = keyword.strip()
-    return _fetch_nodes(subject_id, keyword if keyword else None, sort_by_marks)
+    return _fetch_nodes(subject_id, keyword if keyword else None, sort_mode, descending)
 
 
 def search_nodes(subject_id, keyword):
-    """按关键词搜节点（日常排序）；保留这个函数名，兼容原来的调用。"""
-    return list_nodes(subject_id, keyword, False)
+    """按关键词搜节点（默认按最近浏览时间降序）；保留这个函数名，兼容原来的调用。"""
+    return list_nodes(subject_id, keyword)
 
 
 def list_nodes_by_marks(subject_id, keyword=None):
-    """按「忘过次数」排序查节点，可带搜索关键词（内部与日常排序共用一条 SQL）。"""
-    return list_nodes(subject_id, keyword, True)
+    """按「忘过次数」降序查节点，可带搜索关键词（内部与其他排序共用一条 SQL）。"""
+    return list_nodes(subject_id, keyword, SORT_MARKS, True)
 
 
 def update_node(node_id, title, content):
