@@ -954,7 +954,8 @@ def count_node_marks(node_id):
     """
     查某个节点一共被标记过多少次（同一天只算一次）。
 
-    本任务先把这个函数写出来，留给任务 04 的「按忘过次数排序」用。
+    这个函数只查单个节点；主列表的批量统计由 _fetch_nodes 里的
+    LEFT JOIN 聚合子查询一次算完，不会对每个节点各查一次库。
     """
     row = get_connection().execute(
         'SELECT COUNT(*) AS mark_count FROM marks WHERE node_id = ?',
