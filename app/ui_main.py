@@ -135,8 +135,8 @@ class MainWindow:
             '按最近浏览时间',
             '按忘记次数',
             '按最近忘记时间',
-            '降序（新的 / 多的在前）',
-            '升序（旧的 / 少的在前）',
+            '降序',
+            '升序',
         ]
         self.sort_menu.add_radiobutton(
             label=self._sort_menu_labels[0],
