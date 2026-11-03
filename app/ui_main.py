@@ -6,7 +6,7 @@ app/ui_main.py —— 主窗口
 1. 左侧科目区：科目列表 + 右键菜单（空白处新建科目，科目上改名或删除）；
 2. 右侧节点区：顶部「日历」「?」按钮 + 搜索框 +「排序」菜单 +
    节点表格（ttk.Treeview）；表格空白处右键新建节点；节点上右键
-   「忘记了 / 没忘记 / 打开 / 重命名 / 删除」；
+   「忘记了 / 没忘记 / 打开 / 重命名 / 删除 / 新建节点」；
 3. 把用户操作接到 app\\db.py 的增删改查函数上，并在操作后刷新界面。
 
 关于复习标记与统计（任务 03、04）：
@@ -613,7 +613,7 @@ class MainWindow:
 
         - 点在空白处：弹出「新建节点」；
         - 点在某个节点上：先选中它，再弹出
-          「忘记了 / 没忘记 / 打开 / 重命名 / 删除」。
+          「忘记了 / 没忘记 / 打开 / 重命名 / 删除 / 新建节点」。
         """
         node_id = self._node_id_at(event.y)
         if node_id is None:
@@ -672,6 +672,13 @@ class MainWindow:
                 command=lambda nid=node_id: self.root.after_idle(
                     lambda: self.delete_node(nid)
                 ),
+            )
+            # 列表写满一页时，表格下方没有空白可点，所以在节点菜单里也放一个
+            # 「新建节点」，保证任何时候都能新建，不用先滚到最底下找空白。
+            menu.add_separator()
+            menu.add_command(
+                label='新建节点',
+                command=lambda: self.root.after_idle(self.new_node),
             )
         try:
             menu.tk_popup(event.x_root, event.y_root)
