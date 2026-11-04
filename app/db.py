@@ -8,7 +8,7 @@ app/db.py —— 数据层（SQLite）
 2. 第一次使用时自动创建 data 目录、自动建 subjects、nodes、node_images、marks
    四张表和必要的索引，已经存在就原样复用，绝不删表重建；
    任务 01、02 建的老数据可以直接升级；
-3. 提供科目、节点、笔记图片、复习标记的全部增删改查函数；
+3. 提供科目、节点、笔记资料、复习标记的全部增删改查函数；
 4. 提供节点「忘过几次、最近哪天忘的」统计与按次数排序的查询
    （任务 04，全部用一条 SQL 聚合完成）；
 5. 负责把图片复制进 data\\attachments\\<节点ID>\\，数据库里只存相对项目根目录的路径。
@@ -57,11 +57,14 @@ else:
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 DB_PATH = os.path.join(DATA_DIR, 'knowledge.db')
 
-# 笔记图片副本的根目录：data\attachments\<节点ID>\
+# 笔记资料副本的根目录：data\attachments\<节点ID>\
 ATTACHMENTS_DIR = os.path.join(DATA_DIR, 'attachments')
 
-# 允许加入的图片扩展名（全部小写，比较前会统一转小写）
+# 允许加入的笔记资料扩展名（全部小写，比较前会统一转小写）
+# 图片双击后交给系统默认的看图软件；文本双击后交给系统默认的编辑器。
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
+TEXT_EXTENSIONS = ('.txt', '.md', '.markdown')
+ATTACHMENT_EXTENSIONS = IMAGE_EXTENSIONS + TEXT_EXTENSIONS
 
 # 全项目统一的时间格式：本地时间，精确到秒
 TIME_FORMAT = '%Y-%m-%d %H:%M:%S'
@@ -276,7 +279,7 @@ def _fetch_nodes(subject_id, keyword=None, sort_mode=SORT_VIEWED, descending=Tru
     列表里就只剩「忘过」的节点了。
 
     除统计外还带出两个字段供界面使用：
-    - image_count：这个节点有几张笔记图片，主界面用它显示「[3 图]」；
+    - image_count：这个节点有几份笔记资料，主界面用它显示「[3 附件]」；
     - is_marked_today：1 表示逻辑今天被标记过，界面据此把整行显示成红色。
 
     「今天有没有被标记」用 LEFT JOIN + 唯一索引判断：
@@ -470,11 +473,37 @@ def touch_node_viewed(node_id):
 
 
 # ---------------------------------------------------------------------------
-# 笔记图片相关的增删改查
+# 笔记资料（图片、TXT、Markdown）相关的增删改查
 # ---------------------------------------------------------------------------
 
+def attachment_kind(filename):
+    """
+    根据扩展名判断一条笔记资料是图片还是文本。
+
+    返回 'image' 或 'text'；扩展名不在白名单里时返回 'unknown'。
+    """
+    extension = os.path.splitext(filename)[1].lower()
+    if extension in IMAGE_EXTENSIONS:
+        return 'image'
+    if extension in TEXT_EXTENSIONS:
+        return 'text'
+    return 'unknown'
+
+
+def attachment_type_label(filename):
+    """返回界面上显示的类型文字：图片 / 文本 / Markdown / 文件。"""
+    extension = os.path.splitext(filename)[1].lower()
+    if extension in IMAGE_EXTENSIONS:
+        return '图片'
+    if extension == '.txt':
+        return '文本'
+    if extension in ('.md', '.markdown'):
+        return 'Markdown'
+    return '文件'
+
+
 def attachments_dir(node_id):
-    """返回某个节点存放图片副本的文件夹完整路径。"""
+    """返回某个节点存放笔记资料副本的文件夹完整路径。"""
     return os.path.join(ATTACHMENTS_DIR, str(node_id))
 
 
@@ -516,29 +545,32 @@ def _remove_file_quietly(path):
         pass
 
 
-def store_image_file(node_id, source_path):
+def store_attachment_file(node_id, source_path):
     """
-    把一张图片复制进 data\\attachments\\<节点ID>\\ 并写入数据库记录。
+    把一个笔记资料文件（图片 / TXT / Markdown）复制进
+    data\\attachments\\<节点ID>\\ 并写入数据库记录。
 
     规则：
     1. 保留原文件名；
     2. 重名时自动加 _1、_2 后缀，绝不覆盖已有文件；
     3. 数据库里存相对项目根目录的路径，整个项目文件夹拷走还能用；
-    4. 新图片排在最后；
+    4. 新资料排在最后；
     5. 任何一步失败都把已经复制的文件删掉，不留下垃圾。
 
-    返回新图片记录的 id。
+    返回新记录的 id。
     """
     if get_node(node_id) is None:
-        raise ValueError('节点已经不存在，无法添加图片。')
+        raise ValueError('节点已经不存在，无法添加文件。')
 
     source_path = os.path.abspath(source_path)
     if not os.path.isfile(source_path):
-        raise FileNotFoundError('找不到图片文件：%s' % source_path)
+        raise FileNotFoundError('找不到文件：%s' % source_path)
 
     extension = os.path.splitext(source_path)[1].lower()
-    if extension not in IMAGE_EXTENSIONS:
-        raise ValueError('不支持的图片类型：%s' % extension)
+    if extension not in ATTACHMENT_EXTENSIONS:
+        raise ValueError(
+            '不支持的文件类型：%s（只支持图片、TXT、Markdown）' % extension
+        )
 
     folder = attachments_dir(node_id)
     os.makedirs(folder, exist_ok=True)
@@ -554,7 +586,7 @@ def store_image_file(node_id, source_path):
 
     # 复制完再确认一次文件真的在，避免磁盘异常时留下空记录
     if not os.path.exists(target_path):
-        raise OSError('图片复制失败，目标文件不存在：%s' % target_path)
+        raise OSError('文件复制失败，目标文件不存在：%s' % target_path)
 
     # 存相对项目根目录的路径，例如 data\attachments\12\笔记第1页.jpg
     stored_path = os.path.relpath(target_path, BASE_DIR)
@@ -572,8 +604,13 @@ def store_image_file(node_id, source_path):
         raise
 
 
+def store_image_file(node_id, source_path):
+    """旧名字，保留给旧代码调用；实际工作交给 store_attachment_file。"""
+    return store_attachment_file(node_id, source_path)
+
+
 def list_node_images(node_id):
-    """按顺序列出某个节点的全部图片（sort_order 小的在前）。"""
+    """按顺序列出某个节点的全部笔记资料（sort_order 小的在前）。"""
     rows = get_connection().execute(
         'SELECT id, node_id, filename, stored_path, sort_order, created_at '
         'FROM node_images WHERE node_id = ? '
@@ -594,7 +631,7 @@ def get_node_image(image_id):
 
 
 def count_node_images(node_id):
-    """统计某个节点下有几张图片。"""
+    """统计某个节点下有几份笔记资料。"""
     row = get_connection().execute(
         'SELECT COUNT(*) AS count FROM node_images WHERE node_id = ?',
         (node_id,),
@@ -603,7 +640,7 @@ def count_node_images(node_id):
 
 
 def next_image_sort_order(node_id):
-    """返回某个节点下一张图片应该用的排序号（当前最大号加 1）。"""
+    """返回某个节点下一份笔记资料应该用的排序号（当前最大号加 1）。"""
     row = get_connection().execute(
         'SELECT MAX(sort_order) AS max_order FROM node_images WHERE node_id = ?',
         (node_id,),
@@ -615,7 +652,7 @@ def next_image_sort_order(node_id):
 
 
 def add_node_image(node_id, filename, stored_path, sort_order):
-    """新增一条图片记录，返回新记录的 id。"""
+    """新增一条笔记资料记录，返回新记录的 id。"""
     connection = get_connection()
     with connection:
         cursor = connection.execute(
@@ -629,7 +666,7 @@ def add_node_image(node_id, filename, stored_path, sort_order):
 
 def delete_node_image(image_id):
     """
-    删除一条图片记录，返回被删记录里的 stored_path。
+    删除一条笔记资料记录，返回被删记录里的 stored_path。
 
     注意：这里只删数据库记录，磁盘上的那份文件由界面层负责删，
     因为界面层需要先知道路径，才能决定删文件失败时怎么提示。
@@ -727,7 +764,7 @@ def reorder_node_images(node_id, ordered_image_ids):
 
 def _normalize_image_filename(current_filename, requested_name):
     """
-    校验并整理「重命名图片」时输入的新文件名。
+    校验并整理「重命名笔记资料」时输入的新文件名。
 
     规则：
     - 不能为空，不能带路径，不能含 Windows 文件名禁用字符；
@@ -787,7 +824,7 @@ def _normalize_image_filename(current_filename, requested_name):
 
 def rename_node_image_file(image_id, requested_name):
     """
-    给一张图片重命名：磁盘上的副本和数据库里的 filename、stored_path 一起改。
+    给一份笔记资料重命名：磁盘上的副本和数据库里的 filename、stored_path 一起改。
 
     只改文件名，不换文件夹，也不动 sort_order。
     成功返回新文件名；失败抛异常，由界面层显示具体原因：
@@ -800,7 +837,7 @@ def rename_node_image_file(image_id, requested_name):
     """
     image = get_node_image(image_id)
     if image is None:
-        raise ValueError('这条图片记录已经不存在了。')
+        raise ValueError('这条文件记录已经不存在了。')
 
     old_filename = image['filename']
     new_filename = _normalize_image_filename(old_filename, requested_name)
@@ -814,7 +851,7 @@ def rename_node_image_file(image_id, requested_name):
 
     old_path = image_absolute_path(image['stored_path'])
     if not os.path.isfile(old_path):
-        raise FileNotFoundError('磁盘上的图片文件已经丢失：%s' % old_path)
+        raise FileNotFoundError('磁盘上的文件已经丢失：%s' % old_path)
 
     folder = os.path.dirname(old_path)
     new_path = os.path.join(folder, new_filename)
@@ -830,7 +867,7 @@ def rename_node_image_file(image_id, requested_name):
             (new_filename, new_stored_path, image_id),
         )
     if cursor.rowcount == 0:
-        raise ValueError('这条图片记录已经不存在了。')
+        raise ValueError('这条文件记录已经不存在了。')
 
     try:
         os.rename(old_path, new_path)
@@ -848,7 +885,7 @@ def rename_node_image_file(image_id, requested_name):
 
 def delete_node_images(node_id):
     """
-    删除某个节点下的全部图片记录，返回删除的条数。
+    删除某个节点下的全部笔记资料记录，返回删除的条数。
 
     只删数据库记录，不删磁盘文件；删节点、删科目时由调用方清理文件夹。
     """

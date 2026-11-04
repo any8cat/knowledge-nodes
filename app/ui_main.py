@@ -23,7 +23,7 @@ app/ui_main.py —— 主窗口
 - 标记和撤销都不弹提示、也不写状态栏：列表里变红（或红色消失）本身就是反馈。
 
 说明：
-- 节点表格用 ttk.Treeview（不是 Listbox）；有笔记图片的节点，标题后面会显示「[3 图]」；
+- 节点表格用 ttk.Treeview（不是 Listbox）；有笔记资料的节点，标题后面会显示「[3 附件]」；
 - 节点顺序完全由数据库查询决定（三种排序共用 db._fetch_nodes 的一条 SQL），
   本文件不做任何排序；
 - 「?」按钮打开只读、可滚动的帮助窗（HelpDialog，在 ui_dialogs.py 里）；
@@ -32,7 +32,6 @@ app/ui_main.py —— 主窗口
 """
 
 import tkinter as tk
-import tkinter.font as tkfont
 import tkinter.font as tkfont
 from tkinter import messagebox, simpledialog, ttk
 
@@ -468,10 +467,10 @@ class MainWindow:
 
         self._show_tree()
         for node in nodes:
-            # 有笔记图片的节点，在标题后面加「[N 图]」标记；没有图就只显示标题
+            # 有笔记资料的节点，在标题后面加「[N 附件]」标记；没有就只显示标题
             image_count = node['image_count']
             if image_count:
-                title = '%s [%d 图]' % (node['title'], image_count)
+                title = '%s [%d 附件]' % (node['title'], image_count)
             else:
                 title = node['title']
 

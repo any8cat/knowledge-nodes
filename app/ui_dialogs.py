@@ -4,7 +4,7 @@ app/ui_dialogs.py —— 四个对话框
 
 职责：
 1. SubjectDialog：新建科目 / 给科目改名的输入小窗口；
-2. NodeDialog：节点详情窗（标题、文字描述、笔记图片、保存、关闭、删除本节点）；
+2. NodeDialog：节点详情窗（标题、文字描述、笔记资料、保存、关闭、删除本节点）；
 3. CalendarDialog：复习月历窗（看哪天忘了什么、点日期看当天、右键撤销标记）；
    年份、月份直接写进输入框（或点小箭头）就能跳月，没有「上一月 / 下一月」按钮；
 4. HelpDialog：使用帮助窗（任务 04），只读、可滚动、可关闭。
@@ -13,12 +13,12 @@ app/ui_dialogs.py —— 四个对话框
 - 本文件只负责界面与输入校验，真正的读写数据库都调用 app\\db.py；
 - SubjectDialog 是模态小窗口；NodeDialog 不是模态，可以同时打开多个，
   主界面的科目、节点列表仍然可以点击；
-- 节点详情窗的图片区底部有「添加图片」按钮，和在表格空白处右键「添加图片」
-  效果完全一样；在图片行上右键可以删除或重命名；
-  按住图片行上下拖动即可调整顺序，拖动中的行会标蓝；
+- 节点详情窗的附件区底部有「添加文件」按钮，和在表格空白处右键「添加文件」
+  效果完全一样；在文件行上右键可以删除或重命名；
+  按住文件行上下拖动即可调整顺序，拖动中的行会标蓝；
 - 「关闭」不保存；内容改过又点关闭时，会先问一句是否确定放弃改动；
-- 笔记图片只显示文件名，不做缩略图，也不用 Pillow；
-- 四种添加方式（按钮、拖放、Ctrl+V、右键菜单）最终都调用同一个 _add_images 方法；
+- 笔记资料支持图片、TXT、Markdown，只显示文件名和类型，不做缩略图，也不用 Pillow；
+- 四种添加方式（按钮、拖放、Ctrl+V、右键菜单）最终都调用同一个 _add_attachments 方法；
 - 日历窗是独立窗口，同时只开一个（由主界面 ui_main.py 控制）；
   格子颜色只看「当前科目 + 当前显示月份」的标记数量，不掺别的科目。
 """
@@ -167,10 +167,10 @@ class NodeDialog:
     - 打开已有节点：NodeDialog(parent, node=节点数据行)，保存后 saved 为 True，
       在里面删掉节点后 deleted 为 True；
     - on_closed：窗口真正关闭前调用，参数是这个 NodeDialog 自己，
-      主界面用它刷新列表、更新「[N 图]」标记。
+      主界面用它刷新列表、更新「[N 附件]」标记。
 
     这个窗口没有 grab_set，不锁主界面，可以同时打开多个节点详情；
-    新节点还没有数据库 id，图片表格为空，此时添加图片会提示先保存。
+    新节点还没有数据库 id，资料表格为空，此时添加文件会提示先保存。
     """
 
     def __init__(self, parent, node=None, subject_id=None, on_closed=None):
@@ -181,7 +181,7 @@ class NodeDialog:
         self.saved = False
         self.deleted = False
         self.on_closed = on_closed
-        # 当前列表里的图片记录，顺序与表格一致
+        # 当前列表里的笔记资料记录，顺序与表格一致
         self.images = []
         # 拖动排序时用到的状态
         self._drag_image_id = None
@@ -255,24 +255,26 @@ class NodeDialog:
         self.title_entry.focus_set()
 
     # ------------------------------------------------------------------
-    # 笔记图片区域
+    # 笔记资料区域
     # ------------------------------------------------------------------
 
     def _build_images_area(self, body):
         """
-        搭出「笔记图片」区域：两列表格 + 表格下方一个「添加图片」按钮。
+        搭出「笔记资料」区域：三列表格 + 表格下方一个「添加文件」按钮。
 
-        操作方式（四种方式等价，最终都调用 _add_images）：
-        - 点「添加图片」按钮：弹出文件选择框；
-        - 右键表格空白处：添加图片；
-        - 把图片文件拖进窗口；
-        - 在资源管理器复制图片文件后按 Ctrl+V；
+        操作方式（四种方式等价，最终都调用 _add_attachments）：
+        - 点「添加文件」按钮：弹出文件选择框；
+        - 右键表格空白处：添加文件；
+        - 把图片 / TXT / Markdown 文件拖进窗口；
+        - 在资源管理器复制文件后按 Ctrl+V；
         另外：
-        - 右键某张图片：删除图片 / 重命名；
-        - 按住某张图片上下拖动：调整顺序，拖动中的行标蓝；
-        - 双击某张图片：用系统默认程序打开原图。
+        - 右键某一份文件：删除文件 / 重命名；
+        - 按住某一份文件上下拖动：调整顺序，拖动中的行标蓝；
+        - 双击某一份文件：用系统默认程序打开（图片看照片，TXT/Markdown 用默认编辑器）。
         """
-        images = ttk.LabelFrame(body, text='笔记图片', padding=6)
+        images = ttk.LabelFrame(
+            body, text='笔记资料（图片 / TXT / Markdown）', padding=6
+        )
         images.grid(
             row=3, column=0, columnspan=2, sticky='nsew', pady=(10, 0)
         )
@@ -282,18 +284,22 @@ class NodeDialog:
 
         self.image_tree = ttk.Treeview(
             images,
-            columns=('order', 'filename'),
+            columns=('order', 'kind', 'filename'),
             show='headings',
             selectmode='browse',
             height=10,
         )
         self.image_tree.heading('order', text='序号')
-        self.image_tree.heading('filename', text='文件名')
+        self.image_tree.heading('kind', text='类型')
+        self.image_tree.heading('filename', text='文件名', anchor='w')
         self.image_tree.column(
             'order', width=60, minwidth=50, anchor='center', stretch=False
         )
         self.image_tree.column(
-            'filename', width=620, minwidth=200, anchor='w', stretch=True
+            'kind', width=90, minwidth=70, anchor='center', stretch=False
+        )
+        self.image_tree.column(
+            'filename', width=530, minwidth=200, anchor='w', stretch=True
         )
         self.image_tree.grid(row=0, column=0, sticky='nsew')
 
@@ -303,11 +309,9 @@ class NodeDialog:
         image_scroll.grid(row=0, column=1, sticky='ns')
         self.image_tree.configure(yscrollcommand=image_scroll.set)
 
-        # 图片区底部的「添加图片」按钮：和右键菜单、拖放、Ctrl+V 走同一个入口。
-        # 任务 04 的帮助里写了「点按钮选文件」，所以这里补上这个按钮，
-        # 让帮助说明和实际界面保持一致。
+        # 附件区底部的「添加文件」按钮：和右键菜单、拖放、Ctrl+V 走同一个入口。
         add_image_button = ttk.Button(
-            images, text='添加图片', command=self._on_add_images
+            images, text='添加文件', command=self._on_add_attachments
         )
         add_image_button.grid(
             row=1, column=0, columnspan=2, sticky='w', pady=(6, 0)
@@ -316,10 +320,10 @@ class NodeDialog:
         # 拖动中的行用浅蓝色背景标出来，表示「正在拖这一行」
         self.image_tree.tag_configure('dragging', background='#cce5ff')
 
-        # 图片行右键菜单：删除、重命名
+        # 文件行右键菜单：删除、重命名
         self.image_row_menu = tk.Menu(self.window, tearoff=0)
         self.image_row_menu.add_command(
-            label='删除图片',
+            label='删除文件',
             command=lambda: self.window.after_idle(self._on_delete_image),
         )
         self.image_row_menu.add_command(
@@ -327,11 +331,11 @@ class NodeDialog:
             command=lambda: self.window.after_idle(self._on_rename_image),
         )
 
-        # 表格空白处右键菜单：添加图片
+        # 表格空白处右键菜单：添加文件
         self.image_blank_menu = tk.Menu(self.window, tearoff=0)
         self.image_blank_menu.add_command(
-            label='添加图片',
-            command=lambda: self.window.after_idle(self._on_add_images),
+            label='添加文件',
+            command=lambda: self.window.after_idle(self._on_add_attachments),
         )
 
         self.image_tree.bind('<Double-1>', self._on_image_double_click)
@@ -358,7 +362,11 @@ class NodeDialog:
                 '',
                 'end',
                 iid=str(image['id']),
-                values=(index, image['filename']),
+                values=(
+                    index,
+                    db.attachment_type_label(image['filename']),
+                    image['filename'],
+                ),
             )
 
     def _renumber_image_rows(self):
@@ -370,8 +378,9 @@ class NodeDialog:
         """
         for index, item_id in enumerate(self.image_tree.get_children(), start=1):
             values = self.image_tree.item(item_id, 'values')
-            filename = values[1] if len(values) > 1 else ''
-            self.image_tree.item(item_id, values=(index, filename))
+            kind = values[1] if len(values) > 1 else ''
+            filename = values[2] if len(values) > 2 else ''
+            self.image_tree.item(item_id, values=(index, kind, filename))
 
     def _on_image_press(self, event):
         """在图片行上按下左键：选中它，并记下拖动起点。"""
@@ -458,7 +467,7 @@ class NodeDialog:
         except Exception as error:
             messagebox.showerror(
                 '排序失败',
-                '图片顺序没有保存：\n%s' % error,
+                '资料顺序没有保存：\n%s' % error,
                 parent=self.window,
             )
             self._refresh_images()
@@ -485,7 +494,7 @@ class NodeDialog:
         return 'break'
 
     def _on_images_blank_right_click(self, event):
-        """右键图片表格外面的空白边框：也当作「空白处」，弹出添加图片。"""
+        """右键资料表格外面的空白边框：也当作「空白处」，弹出添加文件。"""
         self._show_image_menu(self.image_blank_menu, event)
         return 'break'
 
@@ -527,11 +536,11 @@ class NodeDialog:
             stack.extend(widget.winfo_children())
 
     def _on_drop(self, event):
-        """拖放事件：拿到文件路径列表，交给统一的加入图片方法。"""
+        """拖放事件：拿到文件路径列表，交给统一的加入笔记资料方法。"""
         if self.node_id is None:
             messagebox.showinfo(
                 '提示',
-                '请先填写标题并点「保存」，再给节点添加笔记图片。',
+                '请先填写标题并点「保存」，再给节点添加笔记资料。',
                 parent=self.window,
             )
             return event.action
@@ -541,14 +550,14 @@ class NodeDialog:
         except Exception:
             paths = [event.data] if event.data else []
 
-        self._add_images(paths)
+        self._add_attachments(paths)
         return event.action
 
     def _on_paste(self, event=None):
         """
         按 Ctrl+V 时调用。
 
-        - 剪贴板里是图片文件：走统一的加入图片逻辑；
+        - 剪贴板里是文件（图片 / TXT / Markdown）：走统一的加入笔记资料逻辑；
         - 剪贴板里是截图位图：明确提示先另存为文件；
         - 剪贴板里是普通文字：返回 None，让文本框照常粘贴文字。
         """
@@ -558,14 +567,14 @@ class NodeDialog:
             if paths or _clipboard_has_bitmap():
                 messagebox.showinfo(
                     '提示',
-                    '请先填写标题并点「保存」，再给节点添加笔记图片。',
+                    '请先填写标题并点「保存」，再给节点添加笔记资料。',
                     parent=self.window,
                 )
                 return 'break'
             return None
 
         if paths:
-            self._add_images(paths)
+            self._add_attachments(paths)
             return 'break'
 
         if _clipboard_has_bitmap():
@@ -578,31 +587,41 @@ class NodeDialog:
 
         return None
 
-    def _on_add_images(self):
-        """右键空白处选「添加图片」：弹出可多选的文件选择框。"""
-        pattern = ' '.join('*' + extension for extension in db.IMAGE_EXTENSIONS)
+    def _on_add_attachments(self):
+        """右键空白处或点按钮选「添加文件」：弹出可多选的文件选择框。"""
+        image_pattern = ' '.join(
+            '*' + extension for extension in db.IMAGE_EXTENSIONS
+        )
+        text_pattern = ' '.join(
+            '*' + extension for extension in db.TEXT_EXTENSIONS
+        )
+        all_pattern = ' '.join(
+            '*' + extension for extension in db.ATTACHMENT_EXTENSIONS
+        )
         paths = filedialog.askopenfilenames(
             parent=self.window,
-            title='选择笔记图片',
+            title='选择笔记资料',
             filetypes=[
-                ('图片文件', pattern),
+                ('所有支持的文件', all_pattern),
+                ('图片文件', image_pattern),
+                ('文本文件（TXT / Markdown）', text_pattern),
                 ('所有文件', '*.*'),
             ],
         )
         if paths:
-            self._add_images(list(paths))
+            self._add_attachments(list(paths))
 
-    def _add_images(self, paths):
+    def _add_attachments(self, paths):
         """
-        统一的「加入图片」入口：拖放、Ctrl+V、右键菜单三条路都走这里。
+        统一的「加入笔记资料」入口：拖放、Ctrl+V、按钮、右键菜单都走这里。
 
-        只接受 IMAGE_EXTENSIONS 里的扩展名；其它类型忽略并提示。
-        每张图片按当前顺序排到最后，全部加完后刷新一次列表。
+        只接受 ATTACHMENT_EXTENSIONS 里的扩展名（图片、TXT、Markdown）；
+        其它类型忽略并提示。每份资料按当前顺序排到最后，全部加完后刷新一次列表。
         """
         if self.node_id is None:
             messagebox.showinfo(
                 '提示',
-                '请先填写标题并点「保存」，再给节点添加笔记图片。',
+                '请先填写标题并点「保存」，再给节点添加笔记资料。',
                 parent=self.window,
             )
             return
@@ -615,7 +634,7 @@ class NodeDialog:
         for path in paths:
             text = str(path)
             extension = os.path.splitext(text)[1].lower()
-            if os.path.isfile(text) and extension in db.IMAGE_EXTENSIONS:
+            if os.path.isfile(text) and extension in db.ATTACHMENT_EXTENSIONS:
                 valid_paths.append(text)
             else:
                 ignored_names.append(os.path.basename(text) or text)
@@ -623,7 +642,7 @@ class NodeDialog:
         failures = []
         for path in valid_paths:
             try:
-                db.store_image_file(self.node_id, path)
+                db.store_attachment_file(self.node_id, path)
             except Exception as error:
                 failures.append('%s：%s' % (os.path.basename(path), error))
 
@@ -632,18 +651,19 @@ class NodeDialog:
 
         if ignored_names:
             message = (
-                '下面这些文件不是支持的图片类型，已经忽略：\n'
+                '下面这些文件不是支持的类型，已经忽略：\n'
                 + '\n'.join(ignored_names)
-                + '\n\n只支持 png、jpg、jpeg、bmp、gif、webp 这几种图片。'
+                + '\n\n只支持 png、jpg、jpeg、bmp、gif、webp 图片，'
+                '以及 txt、md、markdown 文本。'
             )
             messagebox.showwarning('提示', message, parent=self.window)
 
         if failures:
             message = (
-                '下面这些图片没有加进来：\n'
+                '下面这些文件没有加进来：\n'
                 + '\n'.join(failures)
             )
-            messagebox.showerror('添加图片失败', message, parent=self.window)
+            messagebox.showerror('添加文件失败', message, parent=self.window)
 
     # ------------------------------------------------------------------
     # 图片的选中、打开、删除、重命名、拖动排序
@@ -666,7 +686,7 @@ class NodeDialog:
         return db.get_node_image(image_id)
 
     def _on_image_double_click(self, event):
-        """双击某一行：用系统默认程序打开原图；文件没了就提示清记录。"""
+        """双击某一行：用系统默认程序打开文件；文件没了就提示清记录。"""
         row_id = self.image_tree.identify_row(event.y)
         if not row_id:
             return
@@ -680,8 +700,8 @@ class NodeDialog:
         if not os.path.isfile(path):
             messagebox.showwarning(
                 '文件已丢失',
-                '这张图片的文件已经不存在：\n%s\n\n'
-                '可以用「删除图片」清掉这条记录。' % image['filename'],
+                '这份笔记资料的文件已经不存在：\n%s\n\n'
+                '可以用「删除文件」清掉这条记录。' % image['filename'],
                 parent=self.window,
             )
             return
@@ -690,23 +710,23 @@ class NodeDialog:
             os.startfile(path)
         except OSError as error:
             messagebox.showerror(
-                '打不开图片',
-                '无法打开这张图片：\n%s\n\n%s' % (path, error),
+                '打不开文件',
+                '无法打开这份笔记资料：\n%s\n\n%s' % (path, error),
                 parent=self.window,
             )
 
     def _on_delete_image(self):
-        """删一张图：先二次确认，再删数据库记录和磁盘上的副本。"""
+        """删一份资料：先二次确认，再删数据库记录和磁盘上的副本。"""
         image = self._selected_image()
         if image is None:
             messagebox.showinfo(
-                '提示', '请先在列表里选中一张图片。', parent=self.window
+                '提示', '请先在列表里选中一份笔记资料。', parent=self.window
             )
             return
 
         if not messagebox.askyesno(
             '确认删除',
-            '确定要删除图片「%s」吗？\n'
+            '确定要删除「%s」吗？\n'
             '数据库记录和附件文件夹里的这份文件都会删除。' % image['filename'],
             parent=self.window,
         ):
@@ -740,12 +760,12 @@ class NodeDialog:
         image = self._selected_image()
         if image is None:
             messagebox.showinfo(
-                '提示', '请先在列表里选中一张图片。', parent=self.window
+                '提示', '请先在列表里选中一份笔记资料。', parent=self.window
             )
             return
 
         new_name = simpledialog.askstring(
-            '重命名图片',
+            '重命名文件',
             '请输入新的文件名（含扩展名）：',
             initialvalue=image['filename'],
             parent=self.window,
@@ -760,8 +780,8 @@ class NodeDialog:
         except FileNotFoundError:
             messagebox.showwarning(
                 '文件已丢失',
-                '这张图片的文件已经不存在，不能重命名：\n%s\n\n'
-                '可以用「删除图片」清掉这条记录。' % image['filename'],
+                '这份笔记资料的文件已经不存在，不能重命名：\n%s\n\n'
+                '可以用「删除文件」清掉这条记录。' % image['filename'],
                 parent=self.window,
             )
             return
@@ -1493,19 +1513,21 @@ class HelpDialog:
             'body',
         )
 
-        self.text.insert('end', '\n二、怎么往节点里加笔记图片\n', 'heading')
+        self.text.insert('end', '\n二、怎么往节点里加笔记资料\n', 'heading')
         self.text.insert(
             'end',
-            '1. 双击节点打开详情窗，下面「笔记图片」区任选一种方式添加：\n'
-            '   · 点「添加图片」按钮，在弹出的窗口里选图片文件；\n'
-            '   · 把图片文件从资源管理器直接拖进详情窗；\n'
-            '   · 在资源管理器里复制图片文件，回到详情窗按 Ctrl+V。\n'
-            '2. 支持 png、jpg、jpeg、bmp、gif、webp。图片会复制一份到 data 目录，'
-            '原图以后删掉也不影响。\n'
+            '1. 双击节点打开详情窗，下面「笔记资料」区任选一种方式添加：\n'
+            '   · 点「添加文件」按钮，在弹出的窗口里选文件；\n'
+            '   · 把文件从资源管理器直接拖进详情窗；\n'
+            '   · 在资源管理器里复制文件，回到详情窗按 Ctrl+V。\n'
+            '2. 支持图片（png、jpg、jpeg、bmp、gif、webp）和文本'
+            '（txt、md、markdown）。文件会复制一份到 data 目录，'
+            '原文件以后删掉也不影响。\n'
             '3. 截屏得到的位图不能直接按 Ctrl+V 粘贴：请先在画图等软件里'
             '另存为图片文件，再拖进来或粘贴文件。\n'
-            '4. 在图片行上右键可以删除、重命名；按住图片行上下拖动可以调整顺序；'
-            '双击图片会用 Windows 照片打开。\n',
+            '4. 在文件行上右键可以删除、重命名；按住文件行上下拖动可以调整顺序；'
+            '双击文件会用系统默认程序打开：图片看照片，TXT / Markdown 用你电脑上'
+            '默认的文本编辑器（例如 Notepad--、mdview）。\n',
             'body',
         )
 
@@ -1560,7 +1582,7 @@ class HelpDialog:
             '1. 所有数据都在这个文件夹：\n'
             '   ' + db.DATA_DIR + '\n'
             '2. 其中 knowledge.db 是数据库（科目、节点、标记都在里面），'
-            'attachments 文件夹里是笔记图片。\n'
+            'attachments 文件夹里是笔记资料（图片、TXT、Markdown）。\n'
             '3. 本软件不做自动备份，也没有备份按钮。请偶尔手动复制一份 data 文件夹，'
             '这是唯一可靠的数据保障。\n'
             '4. 换电脑、重装系统或清理磁盘前，先把整个 data 文件夹复制到 U 盘或网盘；'
