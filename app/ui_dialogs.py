@@ -247,7 +247,7 @@ class NodeDialog:
         # 记下打开窗口时的原始内容，用来判断有没有改过
         self._original = self._current_values()
 
-        # 先把图片列表填好，再登记拖放目标和 Ctrl+V
+        # 先把资料列表填好，再登记拖放目标和 Ctrl+V
         self._refresh_images()
         self._register_drop_targets()
 
@@ -383,7 +383,7 @@ class NodeDialog:
             self.image_tree.item(item_id, values=(index, kind, filename))
 
     def _on_image_press(self, event):
-        """在图片行上按下左键：选中它，并记下拖动起点。"""
+        """在资料行上按下左键：选中它，并记下拖动起点。"""
         row_id = self.image_tree.identify_row(event.y)
         if not row_id:
             self._drag_image_id = None
@@ -482,7 +482,7 @@ class NodeDialog:
         return None
 
     def _on_image_right_click(self, event):
-        """右键图片表格：点在图片上弹「删除/重命名」，点在空白处弹「添加」。"""
+        """右键资料表格：点在资料上弹「删除/重命名」，点在空白处弹「添加」。"""
         row_id = self.image_tree.identify_row(event.y)
         if not row_id:
             self._show_image_menu(self.image_blank_menu, event)
@@ -499,7 +499,7 @@ class NodeDialog:
         return 'break'
 
     def _show_image_menu(self, menu, event):
-        """在鼠标位置弹出图片右键菜单。"""
+        """在鼠标位置弹出资料右键菜单。"""
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -666,11 +666,11 @@ class NodeDialog:
             messagebox.showerror('添加文件失败', message, parent=self.window)
 
     # ------------------------------------------------------------------
-    # 图片的选中、打开、删除、重命名、拖动排序
+    # 资料的选中、打开、删除、重命名、拖动排序
     # ------------------------------------------------------------------
 
     def _selected_image(self):
-        """返回表格里当前选中的图片记录，没选中返回 None。"""
+        """返回表格里当前选中的资料记录，没选中返回 None。"""
         selection = self.image_tree.selection()
         if not selection:
             return None
@@ -853,7 +853,7 @@ class NodeDialog:
         """
         点「删除本节点」：二次确认后真的删掉，并告诉调用方已删除。
 
-        图片记录和附件文件夹由 db.delete_node 一起清理，
+        资料记录和附件文件夹由 db.delete_node 一起清理，
         这里不再额外弹任何关于图片的提示，一次确认就够。
         """
         if self.node_id is None:
