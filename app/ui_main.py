@@ -11,8 +11,10 @@ app/ui_main.py —— 主窗口
 
 关于复习标记与统计（任务 03、04）：
 - 节点右键选「忘记了」＝记下「逻辑今天忘了它」；选「没忘记」＝撤销今天的标记；
-- 节点表格有三列：标题、忘过次数、最近标记日期，统计由 db.list_nodes 一条
-  SQL 聚合出来，本文件只负责显示；
+- 节点表格有三列：标题、忘过次数、最近标记日期；链接行显示整组合计，
+  统计由 db.list_node_rows 一条 SQL 聚合出来，本文件只负责显示；
+- 节点可以按住 Ctrl 多选后链接成一组；链接行用楷体加斜体，成员缩进挂在
+  链接行下面，点链接行可以展开/收起；
 - 排序由搜索框右侧的「排序：…」菜单选择：
   「按最近浏览时间」「按忘记次数」「按最近忘记时间」，每种都能再选升序或降序；
 - 逻辑今天被标记过的节点，无论选哪种排序都**显示红色**；
@@ -24,7 +26,7 @@ app/ui_main.py —— 主窗口
 
 说明：
 - 节点表格用 ttk.Treeview（不是 Listbox）；有笔记资料的节点，标题后面会显示「[3 附件]」；
-- 节点顺序完全由数据库查询决定（三种排序共用 db._fetch_nodes 的一条 SQL），
+- 节点顺序完全由数据库查询决定（三种排序共用 db.list_node_rows 的一条 SQL），
   本文件不做任何排序；
 - 「?」按钮打开只读、可滚动的帮助窗（HelpDialog，在 ui_dialogs.py 里）；
 - 本文件不写 SQL，也不直接弹节点详情窗、日历窗、帮助窗的界面，
@@ -43,6 +45,19 @@ from ui_dialogs import CalendarDialog, HelpDialog, NodeDialog, SubjectDialog
 MARKED_TAG = 'marked_today'
 MARKED_COLOR = '#C00000'
 
+# 链接行：楷体 + 斜体，和普通节点区分
+LINK_TAG = 'link_row'
+MARKED_LINK_TAG = 'marked_link_row'
+
+# 搜索命中的行：整行浅黄底色（Treeview 不支持只给单个词上色）
+HIGHLIGHT_TAG = 'search_hit'
+HIGHLIGHT_COLOR = '#FFF2A8'
+
+# 节点行 iid 前缀 / 链接行 iid 前缀。
+# 用前缀区分，避免节点 id 和链接 id 恰好相同、在 Treeview 里撞车。
+NODE_IID_PREFIX = 'node:'
+LINK_IID_PREFIX = 'link:'
+
 
 class MainWindow:
     """主窗口的全部界面与交互。"""
@@ -57,6 +72,14 @@ class MainWindow:
         self.sort_order_var = tk.StringVar(value='desc')  # desc=降序，asc=升序
         self.calendar_dialog = None  # 日历窗口（同时只开一个）
         self.help_dialog = None  # 帮助窗口（同时只开一个）
+
+        # 记住哪些链接是展开的：刷新列表、搜索、排序后还要保持原来的展开状态。
+        # 里面存的是链接 id（整数）。
+        self._expanded_link_ids = set()
+        # 重建树时 Treeview 会触发 open/close 事件，用这个开关避免把状态写乱。
+        self._suspend_tree_events = False
+        # 修正「链接行和普通节点一起被多选」时，防止选择事件递归触发。
+        self._adjusting_selection = False
 
         self._build_ui()
         self._bind_events()
@@ -183,20 +206,20 @@ class MainWindow:
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
 
-        # 三列：标题、忘过次数、最近标记日期。
+        # 树形表格：第 0 列显示标题（链接行是父节点，成员缩进挂在下面），
+        # 后面两列仍是「忘过次数」「最近标记」。
         # 列宽按窗口 1100 计算：左侧科目区 250 + 边距后，右侧还能剩约 800 像素，
-        # 三列合计 750，留出滚动条和边框的余量，所以「3 次」「2026-10-26」
-        # 都能完整显示，不会被挤成省略号。
+        # 三列合计 740，留出滚动条和边框的余量，内容不会被挤成省略号。
         self.tree = ttk.Treeview(
             tree_frame,
-            columns=('title', 'mark_count', 'last_mark'),
-            show='headings',
-            selectmode='browse',
+            columns=('mark_count', 'last_mark'),
+            show='tree headings',
+            selectmode='extended',
         )
-        self.tree.heading('title', text='节点标题')
+        self.tree.heading('#0', text='节点标题')
         self.tree.heading('mark_count', text='忘过次数')
         self.tree.heading('last_mark', text='最近标记')
-        self.tree.column('title', anchor='w', width=500, minwidth=200, stretch=True)
+        self.tree.column('#0', anchor='w', width=500, minwidth=200, stretch=True)
         self.tree.column(
             'mark_count', anchor='center', width=110, minwidth=90, stretch=False
         )
@@ -211,6 +234,23 @@ class MainWindow:
         self.tree.tag_configure(
             MARKED_TAG, foreground=MARKED_COLOR, font=bold_font
         )
+
+        # 链接行：换字体家族（优先楷体）+ 斜体，和普通节点明显区分。
+        # 如果系统没有楷体，退回微软雅黑，仍然保留斜体，不会变成方框。
+        families = set(tkfont.families(self.root))
+        link_family = 'KaiTi' if 'KaiTi' in families else 'Microsoft YaHei'
+        self.link_font = tkfont.nametofont('TkDefaultFont').copy()
+        self.link_font.configure(family=link_family, slant='italic')
+        self.link_bold_font = self.link_font.copy()
+        self.link_bold_font.configure(weight='bold')
+        self.tree.tag_configure(LINK_TAG, font=self.link_font)
+        self.tree.tag_configure(
+            MARKED_LINK_TAG, foreground=MARKED_COLOR, font=self.link_bold_font
+        )
+
+        # 搜索命中的行整行加浅黄底色。Treeview 不能只给一个词上色，
+        # 所以用整行标黄来满足「关键字标黄」的需求。
+        self.tree.tag_configure(HIGHLIGHT_TAG, background=HIGHLIGHT_COLOR)
 
         self.tree_scroll = ttk.Scrollbar(
             tree_frame, orient='vertical', command=self.tree.yview
@@ -232,6 +272,9 @@ class MainWindow:
         self.tree.bind('<Button-1>', self._on_tree_left_click)
         self.tree.bind('<Button-3>', self._on_tree_right_click)
         self.tree.bind('<Double-1>', self._on_tree_double_click)
+        self.tree.bind('<<TreeviewOpen>>', self._on_tree_open)
+        self.tree.bind('<<TreeviewClose>>', self._on_tree_close)
+        self.tree.bind('<<TreeviewSelect>>', self._on_tree_select)
         # 列表为空时表格被提示文字盖住，右键要绑在提示文字上才能弹出菜单
         self.placeholder.bind('<Button-3>', self._on_tree_right_click)
 
@@ -423,42 +466,155 @@ class MainWindow:
     # 节点区
     # ------------------------------------------------------------------
 
-    def refresh_nodes(self, select_id=None):
+    def refresh_nodes(self, select_id=None, select_link_id=None):
         """
         按「当前科目 + 当前搜索词 + 当前排序方式」重新读取节点并填满右侧表格。
 
-        搜索与排序都交给 db.list_nodes 的同一个查询完成，这里不再排序。
+        数据分两次查：
+        - db.list_node_rows：链接行 + 没有加入链接的普通节点行，已经在 SQL 里排好序；
+        - db.list_link_children：所有链接成员一次查完，界面只负责按 link_id 挂到父行下面。
+        这样无论展开多少链接，都不会对每个链接单独查库。
+
+        搜索（在界面层做，因为要给整行标黄）：
+        - 普通节点：标题或文字描述包含关键词才显示；
+        - 链接：链接名命中，或组内任意成员命中，才显示；
+        - 成员命中时自动展开该链接，只显示命中的成员；链接名命中则显示全部成员。
+
         红色与置顶规则（重要）：
         - 逻辑今天标记过的行，无论选哪种排序都显示红色；
         - 只有「按最近浏览时间 + 降序」的默认日常模式才置顶；
-        - 按次数、按最近忘记时间，以及任何升序，都只红不置顶，
-          否则排序结果会被置顶规则打乱；
+        - 按次数、按最近忘记时间，以及任何升序，都只红不置顶。
         结果为空时用提示文字代替表格。
         """
         keyword = self.keyword_var.get().strip()
+        keyword_lower = keyword.lower()
         sort_mode = self.sort_mode_var.get()
         descending = self.sort_order_var.get() == 'desc'
+
+        previous_selection = self.tree.selection()
+        self._suspend_tree_events = True
         self.tree.delete(*self.tree.get_children())
 
         if self.current_subject_id is None:
+            self._suspend_tree_events = False
             if not self.subjects:
                 self._show_placeholder('请先新建一个科目')
             else:
                 self._show_placeholder('请先在左边选中一个科目')
             return
 
-        # 所有排序共用这一个函数、同一条 SQL，只由 sort_mode + descending 决定 ORDER BY；
-        # 搜索关键词也一起传进去，保证「排序 + 搜索」仍然按当前方式排。
-        nodes = db.list_nodes(
+        rows = db.list_node_rows(
             self.current_subject_id,
-            keyword,
             sort_mode=sort_mode,
             descending=descending,
         )
+        child_rows = db.list_link_children(self.current_subject_id)
 
-        if not nodes:
+        # 按 link_id 分组，成员顺序就是数据库里的 sort_order
+        children_by_link = {}
+        for child in child_rows:
+            children_by_link.setdefault(child['link_id'], []).append(child)
+
+        expanded = set(self._expanded_link_ids)
+        inserted = 0
+
+        for row in rows:
+            if row['row_type'] == 'link':
+                link_id = row['row_id']
+                link_name_match = bool(
+                    keyword_lower and keyword_lower in row['title'].lower()
+                )
+                children = children_by_link.get(link_id, [])
+                matched_children = [
+                    child for child in children
+                    if keyword_lower and self._node_matches(child, keyword_lower)
+                ]
+
+                # 搜索时：链接名或任一成员命中才保留这一行
+                if keyword_lower and not link_name_match and not matched_children:
+                    continue
+
+                # 成员命中就自动展开；链接名命中但成员没命中时保持原展开状态
+                is_open = link_id in expanded
+                if keyword_lower and matched_children and not link_name_match:
+                    is_open = True
+                if keyword_lower and matched_children:
+                    self._expanded_link_ids.add(link_id)
+
+                link_tags = []
+                if row['is_marked_today']:
+                    link_tags.append(MARKED_LINK_TAG)
+                else:
+                    link_tags.append(LINK_TAG)
+                if link_name_match:
+                    link_tags.append(HIGHLIGHT_TAG)
+
+                self.tree.insert(
+                    '',
+                    'end',
+                    iid=LINK_IID_PREFIX + str(link_id),
+                    text=row['title'],
+                    values=(
+                        '%d 次' % row['mark_count'],
+                        row['last_mark_date'] or '—',
+                    ),
+                    tags=tuple(link_tags),
+                    open=is_open,
+                )
+                inserted += 1
+
+                # 链接名命中时显示全部成员；否则只显示命中的成员
+                visible_children = children
+                if keyword_lower and not link_name_match:
+                    visible_children = matched_children
+                for child in visible_children:
+                    child_match = bool(
+                        keyword_lower and self._node_matches(child, keyword_lower)
+                    )
+                    child_tags = []
+                    if child['is_marked_today']:
+                        child_tags.append(MARKED_TAG)
+                    if child_match:
+                        child_tags.append(HIGHLIGHT_TAG)
+                    self.tree.insert(
+                        LINK_IID_PREFIX + str(link_id),
+                        'end',
+                        iid=NODE_IID_PREFIX + str(child['node_id']),
+                        text=self._node_display_title(child),
+                        values=(
+                            '%d 次' % child['mark_count'],
+                            child['last_mark_date'] or '—',
+                        ),
+                        tags=tuple(child_tags),
+                    )
+                    inserted += 1
+            else:
+                # 普通节点：不在任何链接里，搜索只影响自己这一行
+                if keyword_lower and not self._node_matches(row, keyword_lower):
+                    continue
+                node_tags = []
+                if row['is_marked_today']:
+                    node_tags.append(MARKED_TAG)
+                if keyword_lower:
+                    node_tags.append(HIGHLIGHT_TAG)
+                self.tree.insert(
+                    '',
+                    'end',
+                    iid=NODE_IID_PREFIX + str(row['row_id']),
+                    text=self._node_display_title(row),
+                    values=(
+                        '%d 次' % row['mark_count'],
+                        row['last_mark_date'] or '—',
+                    ),
+                    tags=tuple(node_tags),
+                )
+                inserted += 1
+
+        self._suspend_tree_events = False
+
+        if inserted == 0:
             if keyword:
-                self._show_placeholder('没有匹配的节点')
+                self._show_placeholder('没有匹配的节点或链接')
             else:
                 self._show_placeholder(
                     '这个科目下还没有节点，在下方空白处右键选「新建节点」添加。'
@@ -466,39 +622,44 @@ class MainWindow:
             return
 
         self._show_tree()
-        for node in nodes:
-            # 有笔记资料的节点，在标题后面加「[N 附件]」标记；没有就只显示标题
-            image_count = node['image_count']
-            if image_count:
-                title = '%s [%d 附件]' % (node['title'], image_count)
-            else:
-                title = node['title']
 
-            # 统计列：没标记过显示「0 次」和「—」，标记过显示「3 次」和日期
-            mark_count = node['mark_count']
-            count_text = '%d 次' % mark_count
-            last_mark_text = node['last_mark_date'] or '—'
+        # 刷新后尽量保持原来的选中行；新建/打开节点时优先选指定的节点
+        target_iid = None
+        if select_link_id is not None:
+            target_iid = LINK_IID_PREFIX + str(select_link_id)
+        elif select_id is not None:
+            target_iid = NODE_IID_PREFIX + str(select_id)
+        elif previous_selection:
+            for iid in previous_selection:
+                if self.tree.exists(iid):
+                    target_iid = iid
+                    break
 
-            # is_marked_today 由 SQL 算好：1 表示逻辑今天被标记过，整行变红。
-            # 次数模式下它只影响颜色、不影响顺序（见 db._fetch_nodes 的 ORDER BY）。
-            if node['is_marked_today']:
-                tags = (MARKED_TAG,)
-            else:
-                tags = ()
-            self.tree.insert(
-                '',
-                'end',
-                iid=str(node['id']),
-                values=(title, count_text, last_mark_text),
-                tags=tags,
-            )
+        if target_iid is not None and self.tree.exists(target_iid):
+            # 选中的是链接里的节点时，把父链接展开，否则这一行看不见
+            parent_iid = self.tree.parent(target_iid)
+            if parent_iid:
+                self.tree.item(parent_iid, open=True)
+                if parent_iid.startswith(LINK_IID_PREFIX):
+                    self._expanded_link_ids.add(
+                        int(parent_iid[len(LINK_IID_PREFIX):])
+                    )
+            self.tree.selection_set(target_iid)
+            self.tree.focus(target_iid)
+            self.tree.see(target_iid)
 
-        if select_id is not None:
-            item = str(select_id)
-            if self.tree.exists(item):
-                self.tree.selection_set(item)
-                self.tree.focus(item)
-                self.tree.see(item)
+    def _node_matches(self, node, keyword_lower):
+        """节点标题或文字描述里是否包含关键词（不区分英文大小写）。"""
+        title = (node['title'] or '').lower()
+        content = (node['content'] or '').lower()
+        return keyword_lower in title or keyword_lower in content
+
+    def _node_display_title(self, node):
+        """节点在列表里的显示文字：标题后面按需加「[N 附件]」。"""
+        image_count = node['image_count']
+        if image_count:
+            return '%s [%d 附件]' % (node['title'], image_count)
+        return node['title']
 
     def _show_placeholder(self, text):
         """清空表格区域，改为居中显示一句提示。"""
@@ -563,8 +724,11 @@ class MainWindow:
         重画时尽量保持当前选中的节点，避免它从视野里跑丢。
         """
         selected_id = self._selected_node_id()
+        selected_link_id = self._selected_link_id()
         self._update_sort_button_text()
-        self.refresh_nodes(select_id=selected_id)
+        self.refresh_nodes(
+            select_id=selected_id, select_link_id=selected_link_id
+        )
 
     def _update_sort_button_text(self):
         """把按钮文字更新成「排序：字段 ↑/↓」，让用户一眼看到当前排序。"""
@@ -578,52 +742,186 @@ class MainWindow:
         self.sort_button.configure(text='排序：%s %s' % (mode_text, arrow))
 
     def _selected_node_id(self):
-        """返回右侧表格里当前选中的节点 id，没选中返回 None。"""
+        """返回右侧表格里当前选中的节点 id；选中的是链接或没选中时返回 None。"""
         selection = self.tree.selection()
         if not selection:
             return None
-        return int(selection[0])
+        iid = selection[0]
+        if not iid.startswith(NODE_IID_PREFIX):
+            return None
+        return int(iid[len(NODE_IID_PREFIX):])
 
-    def _node_id_at(self, y):
+    def _selected_node_ids(self):
+        """返回当前选中的所有普通节点 id（按列表里的先后顺序，不含链接行）。"""
+        result = []
+        for iid in self.tree.selection():
+            if iid.startswith(NODE_IID_PREFIX):
+                result.append(int(iid[len(NODE_IID_PREFIX):]))
+        return result
+
+    def _selected_link_id(self):
+        """返回当前选中的链接 id；选中的不是链接时返回 None。"""
+        selection = self.tree.selection()
+        if not selection:
+            return None
+        iid = selection[0]
+        if not iid.startswith(LINK_IID_PREFIX):
+            return None
+        return int(iid[len(LINK_IID_PREFIX):])
+
+    def _row_at(self, y):
         """
-        按鼠标纵坐标找「真正被点中」的节点行。
+        按鼠标纵坐标找「真正被点中」的行 iid。
 
         点在表头、行与行之间的空白，或所有节点下方的空白处时，返回 None，
-        这样右键和左键都能区分「点在节点上」和「点在空白处」。
+        这样右键和左键都能区分「点在行上」和「点在空白处」。
         """
-        row_id = self.tree.identify_row(y)
-        if not row_id:
-            return None
-        return int(row_id)
+        return self.tree.identify_row(y) or None
 
     def _on_tree_left_click(self, event):
         """
-        左键点节点表格：只有点在节点行上才让表格选中它。
-
-        点表格下方空白时保持原来的选中项不变，避免误触。
+        左键点节点表格：
+        - 点链接行（不是左边的小三角）就展开/收起，方便一眼看到组里的节点；
+        - 点普通节点行交给 Treeview 正常选中；
+        - 点表格下方空白时保持原来的选中项不变，避免误触。
         """
-        if self._node_id_at(event.y) is None:
+        iid = self._row_at(event.y)
+        if iid is None:
+            return 'break'
+
+        if iid.startswith(LINK_IID_PREFIX):
+            # 点在左侧展开小三角上时交给 Treeview 自己处理，避免展开两次
+            element = self.tree.identify_element(event.x, event.y)
+            if element == 'Treeitem.indicator':
+                return None
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+            if self.tree.item(iid, 'open'):
+                self.tree.item(iid, open=False)
+                self._expanded_link_ids.discard(
+                    int(iid[len(LINK_IID_PREFIX):])
+                )
+            else:
+                self.tree.item(iid, open=True)
+                self._expanded_link_ids.add(int(iid[len(LINK_IID_PREFIX):]))
             return 'break'
         return None
+
+    def _on_tree_select(self, event=None):
+        """
+        多选只允许普通知识节点。
+
+        按住 Ctrl 时 Treeview 默认会把链接行也加进选择，这里发现选择里
+        既有链接又有普通节点，就把链接行移出选择；如果只选了一个链接，
+        则保留它，方便用户看链接的统计。
+        """
+        if self._suspend_tree_events or self._adjusting_selection:
+            return
+        selection = list(self.tree.selection())
+        links = [iid for iid in selection if iid.startswith(LINK_IID_PREFIX)]
+        nodes = [iid for iid in selection if iid.startswith(NODE_IID_PREFIX)]
+        if not links:
+            return
+        if not nodes and len(links) == 1:
+            return
+
+        self._adjusting_selection = True
+        try:
+            for iid in links:
+                self.tree.selection_remove(iid)
+            if nodes:
+                self.tree.focus(nodes[0])
+            elif links:
+                # 多个链接被同时选中时只保留第一个
+                self.tree.selection_set(links[0])
+                self.tree.focus(links[0])
+        finally:
+            self._adjusting_selection = False
+
+    def _on_tree_open(self, event=None):
+        """用户展开链接时记住状态，刷新列表后还保持展开。"""
+        if self._suspend_tree_events:
+            return
+        iid = self.tree.focus()
+        if iid and iid.startswith(LINK_IID_PREFIX):
+            self._expanded_link_ids.add(int(iid[len(LINK_IID_PREFIX):]))
+
+    def _on_tree_close(self, event=None):
+        """用户收起链接时记住状态，刷新列表后还保持收起。"""
+        if self._suspend_tree_events:
+            return
+        iid = self.tree.focus()
+        if iid and iid.startswith(LINK_IID_PREFIX):
+            self._expanded_link_ids.discard(int(iid[len(LINK_IID_PREFIX):]))
 
     def _on_tree_right_click(self, event):
         """
         右键节点表格。
 
-        - 点在空白处：弹出「新建节点」；
-        - 点在某个节点上：先选中它，再弹出
-          「忘记了 / 没忘记 / 打开 / 重命名 / 删除 / 新建节点」。
+        - 空白处：只弹「新建节点」；
+        - 链接行：只弹「重命名」；
+        - 普通节点行：单选时弹节点菜单（含「踢出链接」）；
+          多选时弹「全部链接 / 全部删除」。
         """
-        node_id = self._node_id_at(event.y)
-        if node_id is None:
+        iid = self._row_at(event.y)
+        if iid is None:
+            self.tree.selection_remove(self.tree.selection())
             self._show_node_menu(event, None)
             return 'break'
 
-        item = str(node_id)
-        self.tree.selection_set(item)
-        self.tree.focus(item)
-        self._show_node_menu(event, node_id)
+        # 右键已选中的多选行时保留整组选择，方便直接操作「全部删除」
+        if iid in self.tree.selection() and len(self.tree.selection()) > 1:
+            pass
+        else:
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+
+        if iid.startswith(LINK_IID_PREFIX):
+            link_id = int(iid[len(LINK_IID_PREFIX):])
+            self._show_link_menu(event, link_id)
+            return 'break'
+
+        node_ids = self._selected_node_ids()
+        if len(node_ids) >= 2:
+            self._show_multi_node_menu(event, node_ids)
+        else:
+            node_id = int(iid[len(NODE_IID_PREFIX):])
+            self._show_node_menu(event, node_id)
         return 'break'
+
+    def _show_link_menu(self, event, link_id):
+        """在鼠标位置弹出链接右键菜单：按用户确认，只提供「重命名」。"""
+        menu = tk.Menu(self.tree, tearoff=0)
+        menu.add_command(
+            label='重命名',
+            command=lambda lid=link_id: self.root.after_idle(
+                lambda: self.rename_link(lid)
+            ),
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _show_multi_node_menu(self, event, node_ids):
+        """多选普通节点时弹出的菜单：全部链接 / 全部删除。"""
+        menu = tk.Menu(self.tree, tearoff=0)
+        menu.add_command(
+            label='全部链接',
+            command=lambda ids=list(node_ids): self.root.after_idle(
+                lambda: self.link_selected_nodes(ids)
+            ),
+        )
+        menu.add_command(
+            label='全部删除',
+            command=lambda ids=list(node_ids): self.root.after_idle(
+                lambda: self.delete_selected_nodes(ids)
+            ),
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     def _show_node_menu(self, event, node_id=None):
         """在鼠标位置弹出节点右键菜单。"""
@@ -637,7 +935,8 @@ class MainWindow:
             # 这一行现在是不是「逻辑今天标过」的：决定「忘记了」「没忘记」哪项可点。
             # 已经标过的再点「忘记了」没有意义，没标过的再点「没忘记」也没有意义，
             # 所以直接把用不上的那项置灰，比点了没反应更好懂。
-            is_marked = MARKED_TAG in self.tree.item(str(node_id), 'tags')
+            iid = NODE_IID_PREFIX + str(node_id)
+            is_marked = MARKED_TAG in self.tree.item(iid, 'tags')
 
             menu.add_command(
                 label='忘记了',
@@ -672,6 +971,14 @@ class MainWindow:
                     lambda: self.delete_node(nid)
                 ),
             )
+            # 只有已经在链接里的节点才显示「踢出链接」
+            if db.get_link_of_node(node_id) is not None:
+                menu.add_command(
+                    label='踢出链接',
+                    command=lambda nid=node_id: self.root.after_idle(
+                        lambda: self.kick_node(nid)
+                    ),
+                )
             # 列表写满一页时，表格下方没有空白可点，所以在节点菜单里也放一个
             # 「新建节点」，保证任何时候都能新建，不用先滚到最底下找空白。
             menu.add_separator()
@@ -685,15 +992,28 @@ class MainWindow:
             menu.grab_release()
 
     def _on_tree_double_click(self, event):
-        """双击表格里的某一行：打开该节点的详情窗。"""
-        row_id = self.tree.identify_row(event.y)
-        if not row_id:
+        """双击普通节点打开详情窗；双击链接行展开/收起，不打开节点。"""
+        iid = self._row_at(event.y)
+        if not iid:
             return
-        self.tree.selection_set(row_id)
-        self.open_node(int(row_id))
+        if iid.startswith(LINK_IID_PREFIX):
+            link_id = int(iid[len(LINK_IID_PREFIX):])
+            if self.tree.item(iid, 'open'):
+                self.tree.item(iid, open=False)
+                self._expanded_link_ids.discard(link_id)
+            else:
+                self.tree.item(iid, open=True)
+                self._expanded_link_ids.add(link_id)
+            return
+        self.tree.selection_set(iid)
+        self.open_node(int(iid[len(NODE_IID_PREFIX):]))
 
     def open_selected_node(self):
-        """打开当前选中的节点（保留给代码调用，界面入口在右键菜单里）。"""
+        """打开当前选中的节点；选中的是链接时展开该链接。"""
+        link_id = self._selected_link_id()
+        if link_id is not None:
+            self.open_link(link_id)
+            return
         node_id = self._selected_node_id()
         if node_id is None:
             messagebox.showinfo(
@@ -729,6 +1049,109 @@ class MainWindow:
             self.refresh_nodes()
         else:
             self.refresh_nodes(select_id=dialog.node_id)
+
+    def link_selected_nodes(self, node_ids):
+        """
+        把多选中的普通节点链接成一个分组。
+
+        用户点「全部链接」后输入链接名；名字、节点合法性都由 db.create_node_link
+        再校验一遍，界面这里只负责给出清楚的错误提示。
+        """
+        if len(node_ids) < 2:
+            messagebox.showinfo(
+                '提示', '请按住 Ctrl 至少选中两个节点。', parent=self.root
+            )
+            return
+
+        name = simpledialog.askstring(
+            '全部链接',
+            '请输入链接名（同一科目内不能重名，最多 50 个字）：',
+            parent=self.root,
+        )
+        if name is None:
+            return
+
+        try:
+            link_id = db.create_node_link(
+                self.current_subject_id, name, node_ids
+            )
+        except ValueError as error:
+            messagebox.showwarning('提示', str(error), parent=self.root)
+            return
+
+        # 新链接默认展开，用户马上能看到组里的节点
+        self._expanded_link_ids.add(link_id)
+        self.refresh_nodes(select_link_id=link_id)
+
+    def delete_selected_nodes(self, node_ids):
+        """多选后的「全部删除」：二次确认后删除节点、附件和标记。"""
+        if not node_ids:
+            return
+        if not messagebox.askyesno(
+            '确认删除',
+            '确定要删除选中的 %d 个节点吗？\n'
+            '它们下面的笔记资料和所有标记也会一起删除，且无法恢复。'
+            % len(node_ids),
+            parent=self.root,
+        ):
+            return
+
+        try:
+            db.delete_nodes(node_ids)
+        except ValueError as error:
+            messagebox.showwarning('提示', str(error), parent=self.root)
+            return
+        self.refresh_nodes()
+
+    def rename_link(self, link_id):
+        """给链接改名；链接名规则由 db.rename_node_link 统一校验。"""
+        link = db.get_node_link(link_id)
+        if link is None:
+            messagebox.showwarning(
+                '提示', '这个链接已经不存在了。', parent=self.root
+            )
+            self.refresh_nodes()
+            return
+
+        new_name = simpledialog.askstring(
+            '重命名链接',
+            '请输入新的链接名（同一科目内不能重名，最多 50 个字）：',
+            initialvalue=link['name'],
+            parent=self.root,
+        )
+        if new_name is None:
+            return
+        try:
+            db.rename_node_link(link_id, new_name)
+        except ValueError as error:
+            messagebox.showwarning('提示', str(error), parent=self.root)
+            return
+        self.refresh_nodes(select_link_id=link_id)
+
+    def kick_node(self, node_id):
+        """
+        把节点踢出链接，节点本身保留。
+
+        链接里还剩其他成员时链接继续存在；踢掉最后一个成员时链接自动消失。
+        不需要二次确认：用户是从该节点的右键菜单明确点的，且节点和资料都不会被删。
+        """
+        try:
+            _link_id, remaining = db.kick_node_from_link(node_id)
+        except ValueError as error:
+            messagebox.showwarning('提示', str(error), parent=self.root)
+            self.refresh_nodes()
+            return
+        if remaining == 0:
+            self._expanded_link_ids.discard(_link_id)
+        self.refresh_nodes(select_id=node_id)
+
+    def open_link(self, link_id):
+        """从日历双击链接时调用：在主列表里展开并选中这个链接。"""
+        if db.get_node_link(link_id) is None:
+            self.refresh_nodes()
+            return
+        self._expanded_link_ids.add(link_id)
+        self.refresh_nodes(select_link_id=link_id)
 
     def rename_node(self, node_id):
         """给节点改标题：只改标题，文字描述原样保留。"""
@@ -917,6 +1340,7 @@ class MainWindow:
         self.calendar_dialog = CalendarDialog(
             self.root,
             on_node_open=self.open_node,
+            on_link_open=self.open_link,
             on_marks_changed=self._on_marks_changed,
         )
 

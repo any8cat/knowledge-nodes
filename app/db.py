@@ -98,7 +98,7 @@ def init_db():
 
 def _create_tables(connection):
     """
-    建立四张表和必要的索引；用 IF NOT EXISTS，重复启动不会重建、不会丢数据。
+    建立所有表和必要的索引；用 IF NOT EXISTS，重复启动不会重建、不会丢数据。
 
     marks 是任务 03 新增的「复习标记」表：
     - 一条记录 = 某个节点在某一天被标了一次「我忘了」；
@@ -145,6 +145,32 @@ def _create_tables(connection):
 
         CREATE UNIQUE INDEX IF NOT EXISTS idx_marks_node_id_marked_date
             ON marks (node_id, marked_date);
+
+        CREATE TABLE IF NOT EXISTS node_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_node_links_subject_id
+            ON node_links (subject_id);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_node_links_subject_name
+            ON node_links (subject_id, name);
+
+        CREATE TABLE IF NOT EXISTS node_link_members (
+            link_id INTEGER NOT NULL,
+            node_id INTEGER NOT NULL,
+            sort_order INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_node_link_members_node_id
+            ON node_link_members (node_id);
+
+        CREATE INDEX IF NOT EXISTS idx_node_link_members_link_id
+            ON node_link_members (link_id);
         """
     )
     connection.commit()
@@ -210,7 +236,7 @@ def delete_subject(subject_id):
     node_ids = [row['id'] for row in node_rows]
 
     with connection:
-        # 先删这些节点的图片记录和标记记录
+        # 先删这些节点的图片记录、标记记录和链接成员关系
         if node_ids:
             placeholders = ', '.join('?' for _ in node_ids)
             connection.execute(
@@ -221,6 +247,17 @@ def delete_subject(subject_id):
                 'DELETE FROM marks WHERE node_id IN (%s)' % placeholders,
                 node_ids,
             )
+            connection.execute(
+                'DELETE FROM node_link_members WHERE node_id IN (%s)'
+                % placeholders,
+                node_ids,
+            )
+
+        # 这个科目下的链接全部删除（成员关系已先清理）
+        connection.execute(
+            'DELETE FROM node_links WHERE subject_id = ?',
+            (subject_id,),
+        )
 
         # 再逐个删除节点对应的附件文件夹
         for node_id in node_ids:
@@ -420,6 +457,349 @@ def list_nodes_by_marks(subject_id, keyword=None):
     return list_nodes(subject_id, keyword, SORT_MARKS, True)
 
 
+# ---------------------------------------------------------------------------
+# 链接（分组）相关的增删改查
+# ---------------------------------------------------------------------------
+
+# 链接名最长 50 个字符，和界面的输入限制保持一致
+LINK_NAME_MAX_LENGTH = 50
+
+
+def _normalize_link_name(name):
+    """
+    校验并整理链接名。
+
+    规则：去掉首尾空格后不能为空，最长 50 个字符，不能含换行等控制字符。
+    返回整理后的名字；不合法时抛 ValueError，由界面层提示。
+    """
+    if not isinstance(name, str):
+        raise ValueError('链接名必须是文字。')
+    text = name.strip()
+    if not text:
+        raise ValueError('链接名不能为空。')
+    if len(text) > LINK_NAME_MAX_LENGTH:
+        raise ValueError('链接名太长了，请控制在 50 个字符以内。')
+    if any(ord(char) < 32 for char in text):
+        raise ValueError('链接名里不能有换行或控制字符。')
+    return text
+
+
+def get_node_link(link_id):
+    """按 id 查一个链接，找不到返回 None。"""
+    row = get_connection().execute(
+        'SELECT id, subject_id, name, created_at FROM node_links WHERE id = ?',
+        (link_id,),
+    ).fetchone()
+    return row
+
+
+def get_link_of_node(node_id):
+    """
+    查某个节点属于哪个链接；不属于任何链接时返回 None。
+
+    一个节点最多只能属于一个链接（node_link_members.node_id 有唯一索引），
+    所以这里最多返回一行。
+    """
+    row = get_connection().execute(
+        'SELECT l.id, l.subject_id, l.name, l.created_at '
+        'FROM node_link_members lm '
+        'JOIN node_links l ON l.id = lm.link_id '
+        'WHERE lm.node_id = ?',
+        (node_id,),
+    ).fetchone()
+    return row
+
+
+def create_node_link(subject_id, name, node_ids):
+    """
+    把同一科目下的多个节点链接成一个分组，返回新链接的 id。
+
+    规则：
+    - 链接名去首尾空格后 1–50 字，同一科目内不能重名；
+    - 至少两个节点；
+    - 所有节点必须存在、属于同一个科目，而且都还没有加入别的链接；
+    - 成员顺序按传入的 node_ids 顺序保存，界面按这个顺序展开。
+
+    任何一条不满足都抛 ValueError，整个操作回滚，不会留下半个链接。
+    """
+    name = _normalize_link_name(name)
+
+    # 去重但保留用户传入的先后顺序：多选时界面就是按列表顺序传进来的
+    ordered_ids = []
+    seen = set()
+    for node_id in node_ids:
+        try:
+            node_id = int(node_id)
+        except (TypeError, ValueError):
+            raise ValueError('要链接的节点不正确，请重新选择。')
+        if node_id not in seen:
+            seen.add(node_id)
+            ordered_ids.append(node_id)
+
+    if len(ordered_ids) < 2:
+        raise ValueError('至少选中两个节点才能链接。')
+
+    connection = get_connection()
+    if connection.execute(
+        'SELECT 1 FROM subjects WHERE id = ?', (subject_id,)
+    ).fetchone() is None:
+        raise ValueError('科目已经不存在了。')
+
+    placeholders = ', '.join('?' for _ in ordered_ids)
+    rows = connection.execute(
+        'SELECT id, subject_id FROM nodes WHERE id IN (%s)' % placeholders,
+        ordered_ids,
+    ).fetchall()
+    if len(rows) != len(ordered_ids):
+        raise ValueError('有节点已经不存在了，请刷新后重新选择。')
+    if any(row['subject_id'] != subject_id for row in rows):
+        raise ValueError('只能链接同一个科目里的节点。')
+
+    linked_rows = connection.execute(
+        'SELECT node_id FROM node_link_members WHERE node_id IN (%s)'
+        % placeholders,
+        ordered_ids,
+    ).fetchall()
+    if linked_rows:
+        raise ValueError('选中的节点里，有的已经属于别的链接了。')
+
+    if connection.execute(
+        'SELECT 1 FROM node_links WHERE subject_id = ? AND name = ?',
+        (subject_id, name),
+    ).fetchone() is not None:
+        raise ValueError('同一科目下已经有同名链接了，请换一个名字。')
+
+    try:
+        with connection:
+            cursor = connection.execute(
+                'INSERT INTO node_links (subject_id, name, created_at) '
+                'VALUES (?, ?, ?)',
+                (subject_id, name, now_text()),
+            )
+            link_id = cursor.lastrowid
+            for order, node_id in enumerate(ordered_ids, start=1):
+                connection.execute(
+                    'INSERT INTO node_link_members '
+                    '(link_id, node_id, sort_order, created_at) '
+                    'VALUES (?, ?, ?, ?)',
+                    (link_id, node_id, order, now_text()),
+                )
+    except sqlite3.IntegrityError:
+        # 唯一索引兜底：比如刚好有另一个窗口同时建了同名链接
+        raise ValueError('同一科目下已经有同名链接了，请换一个名字。')
+    return link_id
+
+
+def rename_node_link(link_id, new_name):
+    """给链接改名；成功返回新名字，链接不存在或重名时抛 ValueError。"""
+    name = _normalize_link_name(new_name)
+    connection = get_connection()
+    link = get_node_link(link_id)
+    if link is None:
+        raise ValueError('这个链接已经不存在了。')
+
+    if name == link['name']:
+        return name
+
+    if connection.execute(
+        'SELECT 1 FROM node_links WHERE subject_id = ? AND name = ? AND id <> ?',
+        (link['subject_id'], name, link_id),
+    ).fetchone() is not None:
+        raise ValueError('同一科目下已经有同名链接了，请换一个名字。')
+
+    try:
+        with connection:
+            connection.execute(
+                'UPDATE node_links SET name = ? WHERE id = ?',
+                (name, link_id),
+            )
+    except sqlite3.IntegrityError:
+        raise ValueError('同一科目下已经有同名链接了，请换一个名字。')
+    return name
+
+
+def kick_node_from_link(node_id):
+    """
+    把某个节点踢出它所在的链接。
+
+    返回 (link_id, remaining_count)。remaining_count 是踢出后链接里还剩几个成员。
+    - 链接里还剩至少一个成员时，链接保留（允许只有一个成员的链接）；
+    - 最后一个成员被踢出时，链接本身也删掉，符合用户确认的规则。
+    节点本来就不在任何链接里时抛 ValueError。
+    """
+    connection = get_connection()
+    row = connection.execute(
+        'SELECT link_id FROM node_link_members WHERE node_id = ?',
+        (node_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError('这个节点还没有加入链接。')
+    link_id = row['link_id']
+
+    with connection:
+        connection.execute(
+            'DELETE FROM node_link_members WHERE node_id = ?',
+            (node_id,),
+        )
+        remaining = connection.execute(
+            'SELECT COUNT(*) AS count FROM node_link_members WHERE link_id = ?',
+            (link_id,),
+        ).fetchone()['count']
+        if remaining == 0:
+            connection.execute(
+                'DELETE FROM node_links WHERE id = ?',
+                (link_id,),
+            )
+    return link_id, remaining
+
+
+def list_node_rows(subject_id, sort_mode=SORT_VIEWED, descending=True):
+    """
+    主列表用：把「链接行」和「没有加入链接的节点行」放在同一条 SQL 里查出来。
+
+    链接行（row_type='link'）：
+    - 忘记次数 = 组内所有节点忘记次数之和；
+    - 最近标记日期 = 组内最近的一天；
+    - is_marked_today = 组内任意一个节点今天被标记过；
+    - last_viewed_at = 组内最近打开时间；
+    - child_count = 成员数量。
+    普通节点行（row_type='node'）只包含没有加入链接的节点，统计仍是自己的。
+
+    六种排序和主界面「排序」菜单一一对应；当天红色、置顶规则与原来一致：
+    - 所有模式都保留红色；
+    - 只有「最近浏览 + 降序」把今天标记的行置顶；
+    - 链接行如果今天有成员被标记，也按一整行置顶，不会把成员拆开。
+    """
+    if sort_mode not in SORT_MODES:
+        raise ValueError('未知排序方式：%r' % (sort_mode,))
+
+    today = dates.today_text()
+    inner_sql = (
+        'WITH node_data AS ('
+        '    SELECT n.id, n.title, n.content, n.created_at, n.last_viewed_at, '
+        '           (SELECT COUNT(*) FROM node_images i WHERE i.node_id = n.id) '
+        '               AS image_count, '
+        '           COALESCE(agg.mark_count, 0) AS mark_count, '
+        '           agg.last_mark_date AS last_mark_date, '
+        '           CASE WHEN m.id IS NULL THEN 0 ELSE 1 END AS is_marked_today, '
+        '           lm.link_id AS link_id '
+        '    FROM nodes n '
+        '    LEFT JOIN marks m ON m.node_id = n.id AND m.marked_date = ? '
+        '    LEFT JOIN ('
+        '        SELECT node_id, COUNT(*) AS mark_count, '
+        '               MAX(marked_date) AS last_mark_date '
+        '        FROM marks GROUP BY node_id'
+        '    ) agg ON agg.node_id = n.id '
+        '    LEFT JOIN node_link_members lm ON lm.node_id = n.id '
+        '    WHERE n.subject_id = ?'
+        '), link_data AS ('
+        '    SELECT l.id AS link_id, l.name AS title, l.created_at, '
+        '           COALESCE(SUM(nd.mark_count), 0) AS mark_count, '
+        '           MAX(nd.last_mark_date) AS last_mark_date, '
+        '           COALESCE(MAX(nd.is_marked_today), 0) AS is_marked_today, '
+        '           MAX(nd.last_viewed_at) AS last_viewed_at, '
+        '           COUNT(nd.id) AS child_count '
+        '    FROM node_links l '
+        '    JOIN node_link_members lm ON lm.link_id = l.id '
+        '    JOIN node_data nd ON nd.id = lm.node_id '
+        '    WHERE l.subject_id = ? '
+        '    GROUP BY l.id'
+        ') '
+        "SELECT 'link' AS row_type, l.link_id AS row_id, NULL AS node_id, "
+        '       l.title AS title, NULL AS content, l.mark_count AS mark_count, '
+        '       l.last_mark_date AS last_mark_date, '
+        '       l.is_marked_today AS is_marked_today, '
+        '       0 AS image_count, l.child_count AS child_count, '
+        '       l.last_viewed_at AS last_viewed_at, l.created_at AS created_at '
+        'FROM link_data l '
+        'UNION ALL '
+        "SELECT 'node' AS row_type, nd.id AS row_id, nd.id AS node_id, "
+        '       nd.title AS title, nd.content AS content, '
+        '       nd.mark_count AS mark_count, '
+        '       nd.last_mark_date AS last_mark_date, '
+        '       nd.is_marked_today AS is_marked_today, '
+        '       nd.image_count AS image_count, 0 AS child_count, '
+        '       nd.last_viewed_at AS last_viewed_at, nd.created_at AS created_at '
+        'FROM node_data nd WHERE nd.link_id IS NULL'
+    )
+
+    if sort_mode == SORT_VIEWED:
+        if descending:
+            order = (
+                'is_marked_today DESC, (last_viewed_at IS NULL) ASC, '
+                'last_viewed_at DESC, created_at DESC, row_type DESC, row_id DESC'
+            )
+        else:
+            order = (
+                '(last_viewed_at IS NULL) ASC, last_viewed_at ASC, '
+                'created_at ASC, row_type ASC, row_id ASC'
+            )
+    elif sort_mode == SORT_MARKS:
+        if descending:
+            order = (
+                'mark_count DESC, (last_mark_date IS NULL) ASC, '
+                'last_mark_date DESC, (last_viewed_at IS NULL) ASC, '
+                'last_viewed_at DESC, created_at DESC, row_id DESC'
+            )
+        else:
+            order = (
+                'mark_count ASC, (last_mark_date IS NULL) ASC, '
+                'last_mark_date ASC, (last_viewed_at IS NULL) ASC, '
+                'last_viewed_at DESC, created_at ASC, row_id ASC'
+            )
+    else:
+        if descending:
+            order = (
+                '(last_mark_date IS NULL) ASC, last_mark_date DESC, '
+                'mark_count DESC, (last_viewed_at IS NULL) ASC, '
+                'last_viewed_at DESC, created_at DESC, row_id DESC'
+            )
+        else:
+            order = (
+                '(last_mark_date IS NULL) ASC, last_mark_date ASC, '
+                'mark_count ASC, (last_viewed_at IS NULL) ASC, '
+                'last_viewed_at DESC, created_at ASC, row_id ASC'
+            )
+
+    sql = 'SELECT * FROM (' + inner_sql + ') ORDER BY ' + order
+    rows = get_connection().execute(
+        sql, (today, subject_id, subject_id)
+    ).fetchall()
+    return list(rows)
+
+
+def list_link_children(subject_id):
+    """
+    一次查出某个科目下所有链接成员节点的统计，按「链接 id、成员顺序」排好。
+
+    界面按 link_id 分组后插到链接行下面；这样不管展开多少个链接，
+    都只查一次数据库，不会对每个链接单独查一次。
+    每行带自己的 mark_count / last_mark_date / is_marked_today / image_count。
+    """
+    today = dates.today_text()
+    rows = get_connection().execute(
+        'SELECT lm.link_id, lm.sort_order, n.id AS node_id, n.title, n.content, '
+        '       n.created_at, n.last_viewed_at, '
+        '       (SELECT COUNT(*) FROM node_images i WHERE i.node_id = n.id) '
+        '           AS image_count, '
+        '       COALESCE(agg.mark_count, 0) AS mark_count, '
+        '       agg.last_mark_date AS last_mark_date, '
+        '       CASE WHEN m.id IS NULL THEN 0 ELSE 1 END AS is_marked_today '
+        'FROM node_link_members lm '
+        'JOIN nodes n ON n.id = lm.node_id '
+        'LEFT JOIN marks m ON m.node_id = n.id AND m.marked_date = ? '
+        'LEFT JOIN ('
+        '    SELECT node_id, COUNT(*) AS mark_count, '
+        '           MAX(marked_date) AS last_mark_date '
+        '    FROM marks GROUP BY node_id'
+        ') agg ON agg.node_id = n.id '
+        'WHERE n.subject_id = ? '
+        'ORDER BY lm.link_id ASC, lm.sort_order ASC, n.id ASC',
+        (today, subject_id),
+    ).fetchall()
+    return list(rows)
+
+
 def update_node(node_id, title, content):
     """修改节点的标题与文字描述；成功返回 True，节点不存在返回 False。"""
     connection = get_connection()
@@ -431,34 +811,108 @@ def update_node(node_id, title, content):
     return cursor.rowcount > 0
 
 
+def _delete_node_rows(connection, node_ids):
+    """
+    在调用方的事务里删除一批节点，返回真正删掉的节点数。
+
+    除了节点本身，还要删笔记资料记录、标记、链接成员关系；
+    如果某个链接因为这次删除而一个成员都不剩，链接也一起删掉。
+    """
+    if not node_ids:
+        return 0
+
+    placeholders = ', '.join('?' for _ in node_ids)
+
+    # 先记下受影响的链接，删完成员关系后才能判断哪些链接空了
+    link_rows = connection.execute(
+        'SELECT DISTINCT link_id FROM node_link_members '
+        'WHERE node_id IN (%s)' % placeholders,
+        node_ids,
+    ).fetchall()
+    link_ids = [row['link_id'] for row in link_rows]
+
+    connection.execute(
+        'DELETE FROM node_images WHERE node_id IN (%s)' % placeholders,
+        node_ids,
+    )
+    connection.execute(
+        'DELETE FROM marks WHERE node_id IN (%s)' % placeholders,
+        node_ids,
+    )
+    connection.execute(
+        'DELETE FROM node_link_members WHERE node_id IN (%s)' % placeholders,
+        node_ids,
+    )
+
+    # 成员全被删光的链接，跟着最后一个成员一起消失；只剩 1 个成员的链接保留
+    for link_id in link_ids:
+        remaining = connection.execute(
+            'SELECT COUNT(*) AS count FROM node_link_members WHERE link_id = ?',
+            (link_id,),
+        ).fetchone()['count']
+        if remaining == 0:
+            connection.execute(
+                'DELETE FROM node_links WHERE id = ?',
+                (link_id,),
+            )
+
+    cursor = connection.execute(
+        'DELETE FROM nodes WHERE id IN (%s)' % placeholders,
+        node_ids,
+    )
+    return cursor.rowcount
+
+
 def delete_node(node_id):
     """
-    删除一个节点，并连带删除它下面的所有图片记录、标记记录和附件文件夹。
+    删除一个节点，并连带删除它下面的所有笔记资料记录、标记记录和附件文件夹。
 
-    顺序：先删 node_images 与 marks 记录，再删 data\\attachments\\<节点ID>\\ 文件夹，
-    最后删 nodes 行；整个过程在同一个事务里。
+    如果这个节点属于某个链接：
+    - 链接里还有其他成员：只把该节点踢出，链接保留；
+    - 它是最后一个成员：链接也一起删除。
     成功返回 True，节点不存在返回 False。
     """
     connection = get_connection()
     folder = attachments_dir(node_id)
 
     with connection:
-        connection.execute(
-            'DELETE FROM node_images WHERE node_id = ?',
-            (node_id,),
-        )
-        # 标记记录跟着节点一起删，避免留下指向不存在节点的孤儿数据
-        connection.execute(
-            'DELETE FROM marks WHERE node_id = ?',
-            (node_id,),
-        )
-        # 文件夹不存在时 rmtree 也不会报错，统一用 ignore_errors
+        deleted = _delete_node_rows(connection, [node_id])
+
+    # 文件夹不存在时 rmtree 也不会报错，统一用 ignore_errors
+    if deleted:
         shutil.rmtree(folder, ignore_errors=True)
-        cursor = connection.execute(
-            'DELETE FROM nodes WHERE id = ?',
-            (node_id,),
-        )
-    return cursor.rowcount > 0
+    return deleted > 0
+
+
+def delete_nodes(node_ids):
+    """
+    批量删除节点（多选后的「全部删除」），返回真正删掉的节点数。
+
+    所有节点、笔记资料记录、标记、链接成员关系、空链接都在同一个事务里删，
+    任何一步失败都整体回滚；附件文件夹在事务成功后才删。
+    """
+    ordered_ids = []
+    seen = set()
+    for node_id in node_ids:
+        try:
+            node_id = int(node_id)
+        except (TypeError, ValueError):
+            raise ValueError('要删除的节点不正确，请刷新后重新选择。')
+        if node_id not in seen:
+            seen.add(node_id)
+            ordered_ids.append(node_id)
+
+    if not ordered_ids:
+        return 0
+
+    connection = get_connection()
+    with connection:
+        deleted = _delete_node_rows(connection, ordered_ids)
+
+    if deleted:
+        for node_id in ordered_ids:
+            shutil.rmtree(attachments_dir(node_id), ignore_errors=True)
+    return deleted
 
 
 def touch_node_viewed(node_id):
@@ -945,23 +1399,63 @@ def unmark_node(node_id, marked_date):
 
 def list_marks_of_date(subject_id, marked_date):
     """
-    查某一天、某个科目下被标记了哪些节点。
+    查某一天、某个科目下被标记了哪些「单位」。
 
-    返回的行里带 mark_id（撤销时用）、node_id（双击打开详情用）、
-    node_title、subject_name（日历下方显示「科目名 › 节点标题」）。
-    按标记时间从早到晚排，同一秒时用 id 兜底，顺序稳定。
+    单位有两种：
+    - item_type='link'：一个链接只显示一行，哪怕组里多个成员当天都被标记过；
+      node_title 是链接名，member_count 是链接成员总数；
+    - item_type='node'：没有加入链接的普通节点，一行一个。
+
+    返回的行里带 mark_id（列表 iid，撤销时用）、link_id / node_id
+    （双击打开链接或节点用）、node_title、subject_name。
+    按最早标记时间排，同一秒时用 mark_id 兜底，顺序稳定。
     """
     rows = get_connection().execute(
-        'SELECT m.id AS mark_id, m.node_id, m.marked_date, m.created_at, '
-        'n.title AS node_title, s.name AS subject_name '
+        "SELECT 'link' AS item_type, l.id AS link_id, NULL AS node_id, "
+        '       l.name AS node_title, s.name AS subject_name, '
+        '       MIN(m.id) AS mark_id, MIN(m.created_at) AS created_at, '
+        '       (SELECT COUNT(*) FROM node_link_members x '
+        '        WHERE x.link_id = l.id) AS member_count '
         'FROM marks m '
         'JOIN nodes n ON n.id = m.node_id '
         'JOIN subjects s ON s.id = n.subject_id '
+        'JOIN node_link_members lm ON lm.node_id = n.id '
+        'JOIN node_links l ON l.id = lm.link_id '
         'WHERE n.subject_id = ? AND m.marked_date = ? '
-        'ORDER BY m.created_at ASC, m.id ASC',
-        (subject_id, marked_date),
+        'GROUP BY l.id '
+        'UNION ALL '
+        "SELECT 'node' AS item_type, NULL AS link_id, n.id AS node_id, "
+        '       n.title AS node_title, s.name AS subject_name, '
+        '       MIN(m.id) AS mark_id, MIN(m.created_at) AS created_at, '
+        '       1 AS member_count '
+        'FROM marks m '
+        'JOIN nodes n ON n.id = m.node_id '
+        'JOIN subjects s ON s.id = n.subject_id '
+        'LEFT JOIN node_link_members lm ON lm.node_id = n.id '
+        'WHERE n.subject_id = ? AND m.marked_date = ? AND lm.node_id IS NULL '
+        'GROUP BY n.id '
+        'ORDER BY created_at ASC, mark_id ASC',
+        (subject_id, marked_date, subject_id, marked_date),
     ).fetchall()
     return list(rows)
+
+
+def unmark_link_on_date(link_id, marked_date):
+    """
+    撤销某个链接在指定日期的标记：删掉组内所有成员在这一天的标记。
+
+    返回删掉的标记条数。日历里撤销链接标记时调用；
+    只影响这一天，别的日期和别的链接都不动。
+    """
+    connection = get_connection()
+    with connection:
+        cursor = connection.execute(
+            'DELETE FROM marks WHERE marked_date = ? AND node_id IN ('
+            '    SELECT node_id FROM node_link_members WHERE link_id = ?'
+            ')',
+            (marked_date, link_id),
+        )
+    return cursor.rowcount
 
 
 def count_marks_by_day(subject_id, year, month):
@@ -977,9 +1471,13 @@ def count_marks_by_day(subject_id, year, month):
     """
     month_prefix = '%04d-%02d' % (year, month)
     rows = get_connection().execute(
-        'SELECT m.marked_date AS marked_date, COUNT(*) AS mark_count '
+        'SELECT m.marked_date AS marked_date, '
+        '       COUNT(DISTINCT CASE '
+        '           WHEN lm.link_id IS NULL THEN \'n:\' || m.node_id '
+        '           ELSE \'l:\' || lm.link_id END) AS mark_count '
         'FROM marks m '
         'JOIN nodes n ON n.id = m.node_id '
+        'LEFT JOIN node_link_members lm ON lm.node_id = n.id '
         'WHERE n.subject_id = ? AND substr(m.marked_date, 1, 7) = ? '
         'GROUP BY m.marked_date',
         (subject_id, month_prefix),

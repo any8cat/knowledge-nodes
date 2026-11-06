@@ -921,21 +921,25 @@ class CalendarDialog:
     DARK_TEXT = '#333333'
     WHITE_TEXT = '#FFFFFF'
 
-    def __init__(self, parent, on_node_open=None, on_marks_changed=None):
+    def __init__(self, parent, on_node_open=None, on_link_open=None,
+                 on_marks_changed=None):
         """
         parent：主窗口；
-        on_node_open：双击某条标记时，用它打开节点详情（主界面的 open_node）；
+        on_node_open：双击普通节点的标记时，用它打开节点详情；
+        on_link_open：双击链接标记时，用它展开并选中链接；
         on_marks_changed：撤销标记后通知主界面刷新列表里的红色。
         """
         self.parent = parent
         self.on_node_open = on_node_open
+        self.on_link_open = on_link_open
         self.on_marks_changed = on_marks_changed
 
         self.subjects = []  # 科目列表（sqlite3.Row）
         self.subject_id = None  # 当前显示的科目 id
         self.marks_by_day = {}  # 当前科目当前月：{'2026-10-28': 2, …}
         self.cell_dates = {}  # (行, 列) → 'YYYY-MM-DD'，空格子为 None
-        self._node_ids = {}  # 标记列表行 iid → 节点 id（双击打开用）
+        # 标记列表行 iid → {'item_type': 'link'/'node', 'id': 链接或节点 id}
+        self._mark_targets = {}
 
         today = dates.today_date()
         self.year = today.year
@@ -1092,11 +1096,20 @@ class CalendarDialog:
             selectmode='browse',
             height=8,
         )
-        self.mark_tree.heading('label', text='科目名 › 节点标题')
+        self.mark_tree.heading('label', text='科目名 › 链接名 / 节点标题')
         self.mark_tree.column(
             'label', anchor='w', width=560, minwidth=200, stretch=True
         )
         self.mark_tree.grid(row=0, column=0, sticky='nsew')
+
+        # 链接标记用楷体 + 斜体，和普通节点明显区分。
+        # 没有楷体时退回微软雅黑，仍然保留斜体。
+        families = set(tkfont.families(self.window))
+        link_family = 'KaiTi' if 'KaiTi' in families else 'Microsoft YaHei'
+        self.link_font = tkfont.nametofont('TkDefaultFont').copy()
+        self.link_font.configure(family=link_family, slant='italic')
+        self.mark_tree.tag_configure('link_mark', font=self.link_font)
+
         self.mark_scroll = ttk.Scrollbar(
             inner, orient='vertical', command=self.mark_tree.yview
         )
@@ -1312,9 +1325,14 @@ class CalendarDialog:
         self._fill_mark_list()
 
     def _fill_mark_list(self):
-        """按「当前科目 + 选中日期」重新填下方列表。"""
+        """
+        按「当前科目 + 选中日期」重新填下方列表。
+
+        按用户确认的口径，日历里一个链接只显示一行，不把组里每个节点各列一遍；
+        普通节点仍然一节点一行。
+        """
         self.mark_tree.delete(*self.mark_tree.get_children())
-        self._node_ids = {}
+        self._mark_targets = {}
 
         if self.subject_id is None:
             self.list_title_var.set('还没有任何科目')
@@ -1331,14 +1349,29 @@ class CalendarDialog:
 
         self._hide_list_empty()
         for mark in marks:
-            item_id = str(mark['mark_id'])
+            is_link = mark['item_type'] == 'link'
+            if is_link:
+                # 链接行带上成员数，提醒这一条代表整组
+                label = '%s › %s（%d 个节点）' % (
+                    mark['subject_name'],
+                    mark['node_title'],
+                    mark['member_count'],
+                )
+                item_id = 'link:%d' % mark['link_id']
+                target = {'item_type': 'link', 'id': mark['link_id']}
+                tags = ('link_mark',)
+            else:
+                label = '%s › %s' % (
+                    mark['subject_name'], mark['node_title']
+                )
+                item_id = 'node:%d' % mark['node_id']
+                target = {'item_type': 'node', 'id': mark['node_id']}
+                tags = ()
+
             self.mark_tree.insert(
-                '',
-                'end',
-                iid=item_id,
-                values=('%s › %s' % (mark['subject_name'], mark['node_title']),),
+                '', 'end', iid=item_id, values=(label,), tags=tags
             )
-            self._node_ids[item_id] = mark['node_id']
+            self._mark_targets[item_id] = target
 
     def _show_list_empty(self, text):
         """
@@ -1359,22 +1392,27 @@ class CalendarDialog:
         self.mark_tree.yview_scroll(int(-event.delta / 120), 'units')
         return 'break'
 
-    def _selected_mark_node_id(self):
-        """返回标记列表里选中那一行对应的节点 id，没选中返回 None。"""
+    def _selected_mark_target(self):
+        """返回标记列表里选中那一行对应的目标，没选中返回 None。"""
         selection = self.mark_tree.selection()
         if not selection:
             return None
-        return self._node_ids.get(selection[0])
+        return self._mark_targets.get(selection[0])
 
     def _on_mark_double_click(self, event):
-        """双击列表里的某条标记：打开那个节点的详情窗。"""
+        """双击普通节点打开详情；双击链接则回到主列表展开该链接。"""
         row_id = self.mark_tree.identify_row(event.y)
         if not row_id:
             return
-        node_id = self._node_ids.get(row_id)
-        if node_id is None or self.on_node_open is None:
+        target = self._mark_targets.get(row_id)
+        if target is None:
             return
-        self.on_node_open(node_id)
+        if target['item_type'] == 'link':
+            if self.on_link_open is not None:
+                self.on_link_open(target['id'])
+            return
+        if self.on_node_open is not None:
+            self.on_node_open(target['id'])
 
     def _on_mark_right_click(self, event):
         """右键标记列表里的一行：弹出「撤销标记」。"""
@@ -1401,28 +1439,37 @@ class CalendarDialog:
         """
         撤销一条标记：二次确认后删除，日历格子和下方列表立刻重画。
 
-        只删「这个节点在选中日期那一天」的记录，别的日期不受影响。
+        普通节点只删「这个节点在选中日期那一天」的记录；
+        链接按用户确认的口径，删掉该链接当天所有成员的标记（整组一起撤销）。
         """
-        node_id = self._node_ids.get(item_id)
-        if node_id is None:
+        target = self._mark_targets.get(item_id)
+        if target is None:
             return
         values = self.mark_tree.item(item_id, 'values')
         label = values[0] if values else ''
-        if not messagebox.askyesno(
-            '确认撤销',
-            '确定撤销「%s」在 %s 的标记吗？' % (label, self.selected_date),
-            parent=self.window,
-        ):
+        if target['item_type'] == 'link':
+            question = (
+                '确定撤销链接「%s」在 %s 的整组标记吗？\n'
+                '组里所有节点这一天的标记都会删除。' % (label, self.selected_date)
+            )
+        else:
+            question = '确定撤销「%s」在 %s 的标记吗？' % (
+                label, self.selected_date
+            )
+        if not messagebox.askyesno('确认撤销', question, parent=self.window):
             return
 
-        db.unmark_node(node_id, self.selected_date)
+        if target['item_type'] == 'link':
+            db.unmark_link_on_date(target['id'], self.selected_date)
+        else:
+            db.unmark_node(target['id'], self.selected_date)
         self._load_marks()
         self._draw_month()
         self._fill_mark_list()
 
         # 主界面列表里的红色也要跟着消失
         if self.on_marks_changed is not None:
-            self.on_marks_changed(node_id)
+            self.on_marks_changed(None)
 
 
 class HelpDialog:
@@ -1499,7 +1546,7 @@ class HelpDialog:
         self.text.focus_set()
 
     def _fill_text(self):
-        """把帮助内容分条写进文本框；六部分与 README.md 的说法保持一致。"""
+        """把帮助内容分条写进文本框；各部分与 README.md 的说法保持一致。"""
         self.text.insert('end', '《知识节点》使用帮助\n', 'title')
 
         self.text.insert('end', '\n一、怎么建科目和知识节点\n', 'heading')
@@ -1549,13 +1596,36 @@ class HelpDialog:
             '1. 点顶部的「日历」按钮打开月历；年份和月份可以直接输入，也能点旁边的小箭头。\n'
             '2. 格子的红色越深，表示这个科目那一天忘记的节点越多；'
             '没有标记的日期是白底蓝字。\n'
-            '3. 点某一天，下面的列表会显示当天标记过的节点；双击一条可以打开节点详情。\n'
-            '4. 在下面的列表里右键选「撤销标记」，就能删掉那一天的标记；'
-            '只影响选中的那一天，别的日期不动。\n',
+            '3. 点某一天，下面的列表会显示当天标记过的节点；链接只显示一行'
+            '（带「N 个节点」），普通节点一行一个。\n'
+            '4. 双击普通节点可以打开详情；双击链接会回到主列表并展开它。\n'
+            '5. 在下面的列表里右键选「撤销标记」，就能删掉那一天的标记；'
+            '普通节点只撤销它自己，链接会撤销组里所有成员当天的标记。\n',
             'body',
         )
 
-        self.text.insert('end', '\n五、排序怎么用\n', 'heading')
+        self.text.insert('end', '\n五、怎么把多个节点链接成一组\n', 'heading')
+        self.text.insert(
+            'end',
+            '1. 在列表里按住 Ctrl，依次点选多个普通节点（链接行不能参与多选）。\n'
+            '2. 在选中的节点上点右键，选「全部链接」，输入链接名（1–50 个字，'
+            '同一科目内不能重名）。\n'
+            '3. 链接名会用楷体加斜体显示，点一下链接行可以展开/收起；'
+            '展开后成员节点缩进显示在下面。\n'
+            '4. 链接的「忘过次数」是组里所有节点次数之和，「最近标记」取组里'
+            '最近的一天；任意成员今天被标记，链接行也会变红。\n'
+            '5. 在成员节点上点右键可以「踢出链接」；成员被删掉时也会自动移出。'
+            '直到最后一个成员被踢出或删除，链接才会消失。\n'
+            '6. 在链接行上点右键可以「重命名」；链接行不提供整组标记，'
+            '标记仍然只在具体节点上做。\n'
+            '7. 搜索时，命中的链接或节点整行标浅黄；如果命中的是链接里的成员，'
+            '会自动展开该链接。\n'
+            '8. 多选后也可以选「全部删除」：会先二次确认，然后删除这些节点、'
+            '它们的笔记资料和标记，删掉后无法恢复。\n',
+            'body',
+        )
+
+        self.text.insert('end', '\n六、排序怎么用\n', 'heading')
         self.text.insert(
             'end',
             '1. 搜索框右边有一个「排序：最近浏览 ↓」按钮，点一下会弹出排序菜单。\n'
@@ -1572,11 +1642,12 @@ class HelpDialog:
             '5. 换排序立即生效，不用重启程序；搜索框里的关键词照样有效，'
             '筛选出来的结果仍按当前方式排序。\n'
             '6. 列表里的「忘过次数」和「最近标记」两列，统计的是这个节点从创建以来'
-            '所有日期的标记；没标记过时显示「0 次」和「—」。\n',
+            '所有日期的标记；没标记过时显示「0 次」和「—」。链接行显示的是整组的'
+            '合计次数和最近日期。\n',
             'body',
         )
 
-        self.text.insert('end', '\n六、数据在哪个文件夹、怎么备份（重要）\n', 'heading')
+        self.text.insert('end', '\n七、数据在哪个文件夹、怎么备份（重要）\n', 'heading')
         self.text.insert(
             'end',
             '1. 所有数据都在这个文件夹：\n'
